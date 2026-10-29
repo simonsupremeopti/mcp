@@ -1,10 +1,4 @@
-import {
-  type Browser,
-  type BrowserContext,
-  type CDPSession,
-  chromium,
-  type Page,
-} from "playwright-core";
+import type { CDPSession, Page } from "playwright-core";
 import type { WebSocket } from "ws";
 
 import {
@@ -20,7 +14,7 @@ import type {
   BrowserBackend,
   ExposedTab,
 } from "@/contracts";
-import { CdpBridge } from "@/relay/bridge";
+import { BrowserSlot } from "@/relay/browser-slot";
 import {
   ExtensionConnection,
   type ExtensionConnectionOptions,
@@ -92,29 +86,20 @@ function sameBrowser(
 const REJECTED_EXTENSION_MS = 30_000;
 
 /**
- * `BrowserBackend` over the relay: the extension connection (one browser at a time), the CDP bridge, and Playwright's `connectOverCDP` to the bridge's `/cdp`. Pages are found by target ID: each new Page's target ID is read once through a short-lived CDP session
+ * `BrowserBackend` over the relay: the extension connection (one browser at a time), its CDP bridge, and Playwright's `connectOverCDP` to the bridge's `/cdp`. Each connected browser gets a `BrowserSlot` of its own. Pages are found by target ID: each new Page's target ID is read once through a short-lived CDP session
  */
 export class RelayBackend implements BrowserBackend {
-  private extension: ExtensionConnection | null = null;
+  private slot: BrowserSlot | null = null;
+  private nextSlotId = 1;
   /** Why the last extension couldn't connect, for `unavailableReason()` */
   private lastProblem: "update-extension" | "update-server" | null = null;
   /** The last extension `/extension` refused by Origin, until one connects: `unavailableReason()` names it, since the extension only retries */
   private rejectedExtension: { id: string | undefined; at: number } | null =
     null;
-  private readonly bridge: CdpBridge;
   private cdpUrl: string | null = null;
-  private browserPromise: Promise<Browser> | null = null;
-  private pages = new Map<string, Page>();
-  private pageWaiters = new Map<string, Set<(page: Page) => void>>();
   /** When the daemon started or the extension last disconnected: the extension is expected back soon after */
   private expectedSince = Date.now();
-  /** The connected extension has sent `state` since `hello` (whose state is always `pending`, before the daemon proves its key) */
-  private stateReceived = false;
   private closing = false;
-  /** Tabs agents used in the connected browser (opened, selected, claimed, or dragged into an app's group) and that are still open: the browser is in use while a session is open and one of them is */
-  private agentTabs = new Set<number>();
-  /** Tab IDs agents used in a browser that another one replaced: here, the same IDs are other tabs, so they're refused until an agent selects them again in this browser */
-  private foreignTabs = new Set<number>();
   /** The last browser, once it disconnected, to tell whether the next one is the same (its service worker restarted) or another */
   private previous: {
     browser: BrowserIdentity;
@@ -132,16 +117,9 @@ export class RelayBackend implements BrowserBackend {
     connection: new Set(),
   } as Listeners;
 
-  constructor(private readonly options: RelayBackendOptions) {
-    this.bridge = new CdpBridge({
-      log: options.log,
-      extension: () => this.extension,
-      onReleased: (tabId, reason) => this.emit("released", { tabId, reason }),
-      reattachDelayMs: options.reattachDelayMs,
-    });
-  }
+  constructor(private readonly options: RelayBackendOptions) {}
 
-  /** Where Playwright connects: the relay's `/cdp?token=…`, known once the relay listens */
+  /** Where Playwright connects: the relay's `/cdp?token=…`, known once the relay listens. Each browser gets `&browser=<id>` on top */
   setCdpUrl(url: string) {
     this.cdpUrl = url;
   }
@@ -177,7 +155,7 @@ export class RelayBackend implements BrowserBackend {
       if (!connection.open) {
         return;
       }
-      const current = this.extension;
+      const current = this.slot;
       if (!current?.open) {
         break;
       }
@@ -192,11 +170,11 @@ export class RelayBackend implements BrowserBackend {
         this.displace(current);
         break;
       }
-      const alive = await current.ping(
+      const alive = await current.connection.ping(
         this.options.replacePingTimeoutMs ?? 3000,
       );
       // Things changed while waiting for the pong (the contender left, the current one closed, or another took over): decide again
-      if (this.extension !== current || !connection.open || this.closing) {
+      if (this.slot !== current || !connection.open || this.closing) {
         continue;
       }
       if (alive) {
@@ -208,7 +186,7 @@ export class RelayBackend implements BrowserBackend {
         return;
       }
       log("The current browser stopped answering; another one replaces it");
-      current.close(
+      current.connection.close(
         RelayCloseCode.anotherBrowser,
         "Another browser is connected to Browser MCP",
       );
@@ -218,16 +196,27 @@ export class RelayBackend implements BrowserBackend {
   }
 
   /** Closes the current browser for another one, remembering it so its retries don't take the connection back */
-  private displace(current: ExtensionConnection) {
-    this.displaced = [...this.displaced.slice(-9), browserOf(current)];
-    current.close(
+  private displace(current: BrowserSlot) {
+    this.displaced = [
+      ...this.displaced.slice(-9),
+      browserOf(current.connection),
+    ];
+    current.connection.close(
       RelayCloseCode.anotherBrowser,
       "Another browser is connected to Browser MCP",
     );
   }
 
-  acceptCdp(ws: WebSocket) {
-    this.bridge.attachClient(ws);
+  /** A Playwright connection on `/cdp`, for the browser named by `browser=<id>` (the only one when unnamed) */
+  acceptCdp(ws: WebSocket, browserId?: string) {
+    const slot = browserId
+      ? this.slots().find((candidate) => candidate.id === browserId)
+      : this.slot;
+    if (!slot) {
+      ws.close(1008, "No such browser");
+      return;
+    }
+    slot.bridge.attachClient(ws);
   }
 
   private adopt(connection: ExtensionConnection) {
@@ -238,48 +227,48 @@ export class RelayBackend implements BrowserBackend {
     const browser = browserOf(connection);
     const previous = this.previous;
     this.previous = null;
+    const id = `b${this.nextSlotId++}`;
+    const slot = new BrowserSlot(id, connection, {
+      log: this.options.log,
+      cdpUrl: () => (this.cdpUrl ? `${this.cdpUrl}&browser=${id}` : null),
+      onReleased: (tabId, reason) => this.emit("released", { tabId, reason }),
+      reattachDelayMs: this.options.reattachDelayMs,
+      pageTimeoutMs: this.options.pageTimeoutMs,
+    });
     // The same browser back (its service worker restarted) keeps its tabs; tab IDs from another browser name other tabs here
     if (
       previous &&
       (sameBrowser(previous.browser, browser) ?? !previous.replaced)
     ) {
-      this.agentTabs = previous.agentTabs;
-      this.foreignTabs = previous.foreignTabs;
-    } else {
-      this.agentTabs = new Set();
-      this.foreignTabs = previous
-        ? new Set([...previous.agentTabs, ...previous.foreignTabs])
-        : new Set();
+      slot.agentTabs = previous.agentTabs;
+      slot.foreignTabs = previous.foreignTabs;
+    } else if (previous) {
+      slot.foreignTabs = new Set([
+        ...previous.agentTabs,
+        ...previous.foreignTabs,
+      ]);
     }
-    this.extension = connection;
+    this.slot = slot;
     this.lastProblem = null;
-    this.stateReceived = false;
     connection.onEvent((event) => {
-      if (this.extension !== connection) {
+      if (this.slot !== slot) {
         return;
       }
-      this.bridge.onExtensionEvent(event);
+      slot.bridge.onExtensionEvent(event);
       switch (event.type) {
         case "state":
-          this.stateReceived = true;
+          slot.stateReceived = true;
           if (event.data.pairing === "paired") {
-            const open = new Set(event.data.tabs.map((tab) => tab.tabId));
-            for (const tabs of [this.agentTabs, this.foreignTabs]) {
-              for (const tabId of tabs) {
-                if (!open.has(tabId)) {
-                  tabs.delete(tabId);
-                }
-              }
-            }
+            slot.pruneClosedTabs(event.data.tabs.map((tab) => tab.tabId));
           }
           this.emit("state", event.data);
           return;
         case "tabAssigned":
           if (event.data.appId) {
-            this.agentTabs.add(event.data.tabId);
-            this.foreignTabs.delete(event.data.tabId);
+            slot.agentTabs.add(event.data.tabId);
+            slot.foreignTabs.delete(event.data.tabId);
           } else {
-            this.agentTabs.delete(event.data.tabId);
+            slot.agentTabs.delete(event.data.tabId);
           }
           this.emit("tabAssigned", event.data);
           return;
@@ -296,23 +285,24 @@ export class RelayBackend implements BrowserBackend {
       ) {
         this.lastProblem = "update-server";
       }
-      if (this.extension !== connection) {
+      if (this.slot !== slot) {
         return;
       }
       const replaced = code === RelayCloseCode.anotherBrowser;
       this.previous = {
         browser: browserOf(connection),
-        agentTabs: this.agentTabs,
-        foreignTabs: this.foreignTabs,
+        agentTabs: slot.agentTabs,
+        foreignTabs: slot.foreignTabs,
         replaced,
       };
       // It went away on its own: a browser it replaced may connect again
       if (!replaced) {
         this.displaced = [];
       }
-      this.extension = null;
+      this.slot = null;
       this.expectedSince = Date.now();
-      this.bridge.releaseAll("disconnected");
+      slot.bridge.releaseAll("disconnected");
+      void slot.close();
       this.emit("connection", { connected: false });
     });
     this.emit("connection", { connected: true });
@@ -322,11 +312,11 @@ export class RelayBackend implements BrowserBackend {
   // --- BrowserBackend ---
 
   get connected(): boolean {
-    return !!this.extension;
+    return !!this.slot;
   }
 
   get paused(): boolean {
-    return this.extension?.state.paused ?? false;
+    return this.slot?.connection.state.paused ?? false;
   }
 
   /** `/extension` refused a connection by its Origin (`id` is undefined unless it was a `chrome-extension://` ID) */
@@ -335,7 +325,8 @@ export class RelayBackend implements BrowserBackend {
   }
 
   unavailableReason(): string | null {
-    if (!this.extension) {
+    const slot = this.slot;
+    if (!slot) {
       if (
         this.rejectedExtension?.id &&
         Date.now() - this.rejectedExtension.at < REJECTED_EXTENSION_MS
@@ -350,8 +341,8 @@ export class RelayBackend implements BrowserBackend {
       }
       return NO_EXTENSION_MESSAGE;
     }
-    if (this.extension.state.pairing === "pending") {
-      return pairingRequiredMessage(this.extension.pairingCode ?? undefined);
+    if (slot.connection.state.pairing === "pending") {
+      return pairingRequiredMessage(slot.connection.pairingCode ?? undefined);
     }
     return null;
   }
@@ -362,8 +353,9 @@ export class RelayBackend implements BrowserBackend {
     // After connecting, the extension sends its state as soon as it checked the daemon's key
     const stateBy = Date.now() + 2000;
     for (;;) {
-      if (this.extension) {
-        if (this.stateReceived || Date.now() >= stateBy) {
+      const slot = this.slot;
+      if (slot) {
+        if (slot.stateReceived || Date.now() >= stateBy) {
           return;
         }
       } else if (Date.now() >= connectBy) {
@@ -375,7 +367,7 @@ export class RelayBackend implements BrowserBackend {
 
   /** The connected browser's tabs: their IDs mean nothing in another browser */
   tabs(): ExposedTab[] {
-    return this.extension?.state.tabs ?? [];
+    return this.slot?.tabs() ?? [];
   }
 
   /** The connected browser's tab with this ID, waiting (briefly) for the extension to report one it doesn't list yet: it reports a new tab a moment after it appears */
@@ -388,11 +380,11 @@ export class RelayBackend implements BrowserBackend {
   }
 
   async createTab(options: { url?: string; app: AppInfo }): Promise<number> {
-    const extension = this.usableExtension();
-    const { tabId } = await extension.request("createTab", options);
-    if (this.extension === extension) {
-      this.agentTabs.add(tabId);
-      this.foreignTabs.delete(tabId);
+    const slot = this.usableSlot();
+    const { tabId } = await slot.connection.request("createTab", options);
+    if (this.slot === slot) {
+      slot.agentTabs.add(tabId);
+      slot.foreignTabs.delete(tabId);
     }
     // The extension reports the new tab in its next `state` (debounced), after answering. Until then the engine would take it for a closed tab
     await this.waitForTab(tabId);
@@ -400,60 +392,59 @@ export class RelayBackend implements BrowserBackend {
   }
 
   async closeTab(tabId: number): Promise<void> {
-    const extension = this.usableExtension();
-    this.refuseForeign(tabId);
-    await this.bridge.release(tabId);
-    this.agentTabs.delete(tabId);
-    await extension.request("closeTab", { tabId });
+    const slot = this.usableSlot();
+    this.refuseForeign(slot, tabId);
+    await slot.bridge.release(tabId);
+    slot.agentTabs.delete(tabId);
+    await slot.connection.request("closeTab", { tabId });
     // As with `createTab`: until the next `state`, the tab would still be listed
     await this.waitForTab(tabId, 3000, false);
   }
 
   async activateTab(tabId: number): Promise<void> {
-    const extension = this.usableExtension();
-    this.refuseForeign(tabId);
-    await extension.request("activateTab", { tabId });
+    const slot = this.usableSlot();
+    this.refuseForeign(slot, tabId);
+    await slot.connection.request("activateTab", { tabId });
   }
 
   /** Grouping a tab with an app selects it in this browser, so it's no longer taken for another browser's tab */
   async groupTab(tabId: number, app: AppInfo | null): Promise<void> {
-    const extension = this.usableExtension();
-    await extension.request("groupTab", { tabId, app });
-    if (this.extension !== extension) {
+    const slot = this.usableSlot();
+    await slot.connection.request("groupTab", { tabId, app });
+    if (this.slot !== slot) {
       return;
     }
     if (app) {
-      this.agentTabs.add(tabId);
-      this.foreignTabs.delete(tabId);
+      slot.agentTabs.add(tabId);
+      slot.foreignTabs.delete(tabId);
     } else {
-      this.agentTabs.delete(tabId);
+      slot.agentTabs.delete(tabId);
     }
   }
 
   noteActivity(appId: string): void {
-    this.extension?.send("activity", { appId }, () => {});
+    this.slot?.connection.send("activity", { appId }, () => {});
   }
 
   /** Claims a tab of the connected browser: one it reports (waiting briefly for a tab it hasn't reported yet), and not a tab ID agents used in a browser it replaced */
   async page(tabId: number): Promise<Page> {
-    const extension = this.usableExtension();
-    this.refuseForeign(tabId);
+    const slot = this.usableSlot();
+    this.refuseForeign(slot, tabId);
     if (!this.tabs().some((tab) => tab.tabId === tabId)) {
       await this.waitForTab(tabId, this.options.unknownTabWaitMs ?? 1000);
-      if (this.extension !== extension) {
+      if (this.slot !== slot) {
         throw new Error(ANOTHER_BROWSER_MESSAGE);
       }
       if (!this.tabs().some((tab) => tab.tabId === tabId)) {
         throw new Error(noSuchTabMessage(tabId));
       }
     }
-    this.agentTabs.add(tabId);
-    const targetInfo = await this.bridge.claim(tabId);
-    if (this.extension !== extension) {
+    slot.agentTabs.add(tabId);
+    const targetInfo = await slot.bridge.claim(tabId);
+    if (this.slot !== slot) {
       throw new Error(ANOTHER_BROWSER_MESSAGE);
     }
-    await this.browser();
-    return await this.waitForPage(targetInfo.targetId);
+    return await slot.pageForTarget(targetInfo.targetId);
   }
 
   async cdpSession(tabId: number): Promise<CDPSession> {
@@ -462,11 +453,11 @@ export class RelayBackend implements BrowserBackend {
   }
 
   async release(tabId: number): Promise<void> {
-    await this.bridge.release(tabId);
+    await this.slot?.bridge.release(tabId);
   }
 
   isClaimed(tabId: number): boolean {
-    return this.bridge.isClaimed(tabId);
+    return this.slot?.bridge.isClaimed(tabId) ?? false;
   }
 
   on<E extends keyof BackendEvents>(
@@ -483,13 +474,20 @@ export class RelayBackend implements BrowserBackend {
   /** Disconnects Playwright and the extension (which reconnects to the next daemon) */
   async close(): Promise<void> {
     this.closing = true;
-    const browser = await this.browserPromise?.catch(() => null);
-    this.browserPromise = null;
-    await browser?.close().catch(() => {});
-    this.extension?.close(RelayCloseCode.shuttingDown, "The daemon is exiting");
+    const slot = this.slot;
+    await slot?.close();
+    slot?.connection.close(
+      RelayCloseCode.shuttingDown,
+      "The daemon is exiting",
+    );
   }
 
   // --- Internals ---
+
+  /** Every connected browser, newest last */
+  private slots(): BrowserSlot[] {
+    return this.slot ? [this.slot] : [];
+  }
 
   private emit<E extends keyof BackendEvents>(
     event: E,
@@ -508,98 +506,28 @@ export class RelayBackend implements BrowserBackend {
 
   /** Whether an agent uses the connected browser: a tab is claimed, or, while a session is open, a tab agents used is still open */
   private inUse(): boolean {
-    if (this.bridge.claimedTabs().length > 0) {
-      return true;
-    }
-    if (this.options.hasSessions && !this.options.hasSessions()) {
-      return false;
-    }
-    const open = new Set(this.tabs().map((tab) => tab.tabId));
-    return [...this.agentTabs].some((tabId) => open.has(tabId));
+    const countAgentTabs =
+      !this.options.hasSessions || this.options.hasSessions();
+    return this.slots().some((slot) => slot.inUse(countAgentTabs));
   }
 
-  private refuseForeign(tabId: number) {
-    if (this.foreignTabs.has(tabId)) {
+  private refuseForeign(slot: BrowserSlot, tabId: number) {
+    if (slot.foreignTabs.has(tabId)) {
       throw new Error(ANOTHER_BROWSER_MESSAGE);
     }
   }
 
-  /** The connected extension, or throws the message the model should see */
-  private usableExtension(): ExtensionConnection {
+  /** The connected browser, or throws the message the model should see */
+  private usableSlot(): BrowserSlot {
     const reason = this.unavailableReason();
-    if (reason || !this.extension) {
+    const slot = this.slot;
+    if (reason || !slot) {
       throw new Error(reason ?? NO_EXTENSION_MESSAGE);
     }
-    if (this.extension.state.paused) {
+    if (slot.connection.state.paused) {
       throw new Error(PAUSED_MESSAGE);
     }
-    return this.extension;
-  }
-
-  private browser(): Promise<Browser> {
-    if (!this.browserPromise) {
-      if (!this.cdpUrl) {
-        return Promise.reject(new Error("The relay isn't listening yet"));
-      }
-      // `noDefaults`: Playwright's default overrides (focus emulation, media emulation, downloads) stay off the user's tabs; the engine turns focus emulation on itself for the tabs it claims (`hiddenTabs`)
-      const promise = chromium
-        .connectOverCDP(this.cdpUrl, { noDefaults: true })
-        .then((browser) => {
-          browser.on("disconnected", () => {
-            if (this.browserPromise === promise) {
-              this.browserPromise = null;
-            }
-            this.pages.clear();
-          });
-          for (const context of browser.contexts()) {
-            this.watchContext(context);
-          }
-          return browser;
-        });
-      promise.catch(() => {
-        if (this.browserPromise === promise) {
-          this.browserPromise = null;
-        }
-      });
-      this.browserPromise = promise;
-    }
-    return this.browserPromise;
-  }
-
-  private watchContext(context: BrowserContext) {
-    context.on("page", (page) => void this.identify(page));
-    for (const page of context.pages()) {
-      void this.identify(page);
-    }
-  }
-
-  /** Reads a new Page's target ID (the bridge answers `Target.getTargetInfo` itself) */
-  private async identify(page: Page) {
-    let targetId: string;
-    try {
-      const session = await page.context().newCDPSession(page);
-      const { targetInfo } = await session.send("Target.getTargetInfo");
-      targetId = targetInfo.targetId;
-      await session.detach().catch(() => {});
-    } catch (error) {
-      if (!page.isClosed()) {
-        this.options.log("Couldn't identify a page:", error);
-      }
-      return;
-    }
-    if (page.isClosed()) {
-      return;
-    }
-    this.pages.set(targetId, page);
-    page.on("close", () => {
-      if (this.pages.get(targetId) === page) {
-        this.pages.delete(targetId);
-      }
-    });
-    for (const resolve of this.pageWaiters.get(targetId) ?? []) {
-      resolve(page);
-    }
-    this.pageWaiters.delete(targetId);
+    return slot;
   }
 
   /** Waits (briefly) until the extension reports the tab, or with `reported: false`, until it no longer does */
@@ -625,29 +553,6 @@ export class RelayBackend implements BrowserBackend {
           done();
         }
       });
-    });
-  }
-
-  private waitForPage(targetId: string): Promise<Page> {
-    const page = this.pages.get(targetId);
-    if (page && !page.isClosed()) {
-      return Promise.resolve(page);
-    }
-    return new Promise((resolve, reject) => {
-      const waiters = this.pageWaiters.get(targetId) ?? new Set();
-      this.pageWaiters.set(targetId, waiters);
-      const waiter = (page: Page) => {
-        clearTimeout(timeout);
-        resolve(page);
-      };
-      const timeout = setTimeout(() => {
-        waiters.delete(waiter);
-        if (waiters.size === 0 && this.pageWaiters.get(targetId) === waiters) {
-          this.pageWaiters.delete(targetId);
-        }
-        reject(new Error("The tab didn't become ready in time"));
-      }, this.options.pageTimeoutMs ?? 15_000);
-      waiters.add(waiter);
     });
   }
 }

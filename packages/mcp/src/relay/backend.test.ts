@@ -44,6 +44,24 @@ async function connect(
   return extension;
 }
 
+/** The connected browser's slot, whose internals some tests reach into */
+function slot() {
+  const current = (
+    relay.backend as unknown as { slot: BrowserSlotInternals | null }
+  ).slot;
+  if (!current) {
+    throw new Error("No browser is connected");
+  }
+  return current;
+}
+
+type BrowserSlotInternals = {
+  bridge: CdpBridge;
+  connection: { pendingCount: number };
+  waitForPage(targetId: string): Promise<unknown>;
+  pageWaiters: Map<string, unknown>;
+};
+
 beforeAll(async () => {
   chromium = await FakeChromium.launch();
 }, 60_000);
@@ -209,9 +227,7 @@ describe("RelayBackend", () => {
     expect(relay.backend.connected).toBe(true);
     // The second one is the browser now
     const tabId = [...second.tabs.keys()][0]!;
-    await (relay.backend as unknown as { bridge: CdpBridge }).bridge.claim(
-      tabId,
-    );
+    await slot().bridge.claim(tabId);
     expect(second.requests.some((request) => request.method === "attach")).toBe(
       true,
     );
@@ -220,9 +236,7 @@ describe("RelayBackend", () => {
   it("refuses a second browser while an agent uses a tab in the first", async () => {
     const first = await connect();
     const tabId = [...first.tabs.keys()][0]!;
-    await (relay.backend as unknown as { bridge: CdpBridge }).bridge.claim(
-      tabId,
-    );
+    await slot().bridge.claim(tabId);
     const second = await connect();
     expect(await second.closed).toMatchObject({
       code: RelayCloseCode.anotherBrowser,
@@ -345,9 +359,7 @@ describe("RelayBackend", () => {
   it("doesn't adopt a contender that left while the current browser was pinged", async () => {
     const first = await connect();
     const tabId = [...first.tabs.keys()][0]!;
-    await (relay.backend as unknown as { bridge: CdpBridge }).bridge.claim(
-      tabId,
-    );
+    await slot().bridge.claim(tabId);
     first.answering = false;
     const connections: boolean[] = [];
     relay.backend.on("connection", ({ connected }) =>
@@ -371,24 +383,19 @@ describe("RelayBackend", () => {
     await expect(relay.backend.activateTab(tabId)).rejects.toThrow(
       "The browser didn't answer activateTab in time",
     );
-    const connection = (
-      relay.backend as unknown as { extension: { pendingCount: number } }
-    ).extension;
-    expect(connection.pendingCount).toBe(0);
+    expect(slot().connection.pendingCount).toBe(0);
     extension.answering = true;
   });
 
   it("forgets page waiters that timed out", async () => {
     await relay.close();
     relay = await startTestBackend({ pageTimeoutMs: 100 });
-    const backend = relay.backend as unknown as {
-      waitForPage(targetId: string): Promise<unknown>;
-      pageWaiters: Map<string, unknown>;
-    };
-    await expect(backend.waitForPage("missing")).rejects.toThrow(
+    await connect();
+    const browser = slot();
+    await expect(browser.waitForPage("missing")).rejects.toThrow(
       "didn't become ready",
     );
-    expect(backend.pageWaiters.size).toBe(0);
+    expect(browser.pageWaiters.size).toBe(0);
   });
 
   it("waits for an extension that's expected back, then answers at once", async () => {
