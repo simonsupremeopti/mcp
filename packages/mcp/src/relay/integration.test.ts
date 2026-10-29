@@ -183,6 +183,26 @@ describe("the bridge with Playwright", () => {
     expect(released).toEqual([]);
   });
 
+  it("keeps working after detaches come faster than the re-attach cooldown", async () => {
+    const tabId = await backendTabId(
+      relay.backend,
+      await extension.openTab(fixtures.url("/")),
+    );
+    await relay.backend.page(tabId);
+    // An extension whose iframe comes back makes the debugger detach again and again
+    for (let i = 0; i < 4; i++) {
+      const tab = extension.tabs.get(extensionTabId(relay.backend, tabId))!;
+      if (tab.sessionId) {
+        await chromium.send("Target.detachFromTarget", {
+          sessionId: tab.sessionId,
+        });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const page = await relay.backend.page(tabId);
+    expect(await page.title()).toBe("Home");
+  });
+
   it("stops on Cancel (canceled_by_user) and while paused", async () => {
     const tabId = await backendTabId(
       relay.backend,

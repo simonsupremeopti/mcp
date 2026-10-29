@@ -197,12 +197,13 @@ get text body --max 1500`,
   await section(
     "agents' tabs: a background tab in the app's named, colored group, and the badge",
     async () => {
+      const alphaChromeTab = await chromeTabIdOf(alpha, alphaTab);
       const info = await inWorker(async (tabId) => {
         const { chrome } = globalThis as unknown as { chrome: Chrome };
         const tab = await chrome.tabs.get(tabId);
         const groups = await chrome.tabGroups.query({});
         return { tab, groups };
-      }, alphaTab);
+      }, alphaChromeTab);
       expect(!info.tab.active, "the agent's tab must not be the active tab");
       const group = info.groups.find((g) => g.id === info.tab.groupId);
       expect(group?.title === "Smoke Alpha", `group ${JSON.stringify(group)}`);
@@ -228,7 +229,7 @@ get count li`,
       const stillBackground = await inWorker(async (tabId) => {
         const { chrome } = globalThis as unknown as { chrome: Chrome };
         return !(await chrome.tabs.get(tabId)).active;
-      }, alphaTab);
+      }, alphaChromeTab);
       expect(stillBackground, "the agent's tab stayed in the background");
       // Headless Chromium hides background tabs as Chrome does: without the daemon's focus emulation, a background tab of the user's doesn't render
       const control = await context.newPage();
@@ -311,7 +312,7 @@ requests --filter api`,
     await inWorker(async (tabId) => {
       const { chrome } = globalThis as unknown as { chrome: Chrome };
       await chrome.tabs.setZoom(tabId, 1.25);
-    }, alphaTab);
+    }, await chromeTabIdOf(alpha, alphaTab));
     const result = await call(
       alpha,
       `eval "() => devicePixelRatio"
@@ -361,7 +362,11 @@ get text #out`,
             })),
           );
         },
-        [blankTab, popupTab, alphaTab],
+        await Promise.all(
+          [blankTab, popupTab, alphaTab].map((id) =>
+            chromeTabIdOf(alpha, id),
+          ),
+        ),
       );
       expect(
         windows.every((w) => w.type === "normal"),
@@ -384,7 +389,7 @@ get text #out`,
     const page = await context.newPage();
     await page.goto(fixtures.url("/ext-frame"));
     await page.locator("iframe").waitFor({ state: "attached" });
-    const tabId = await tabIdOf(page.url());
+    const tabId = await toolTabIdOf(alpha, page.url());
     const result = await call(alpha, `tab select ${tabId}\nget title`);
     // The extension removes the other extension's frame, which can block `debugger.attach()`, and attaches
     expect(!result.isError, result.text);
@@ -402,7 +407,8 @@ get text #out`,
       const page = await context.newPage();
       await page.goto(fixtures.url("/ext-frame-shadow"));
       await page.locator("#ext-host").waitFor({ state: "attached" });
-      const tabId = await tabIdOf(page.url());
+      const tabId = await toolTabIdOf(alpha, page.url());
+      const chromeTabId = await chromeTabIdOf(alpha, tabId);
       // The manifest's content script answers, and can look into the closed shadow root (`chrome.dom`)
       const scan = await inWorker(async (id) => {
         const { chrome } = globalThis as unknown as { chrome: Chrome };
@@ -412,7 +418,7 @@ get text #out`,
           { frameId: 0 },
         );
         return JSON.stringify(reply);
-      }, tabId);
+      }, chromeTabId);
       expect(
         scan.includes('"hasDom":true') && scan.includes('"removed":1'),
         `content script reply ${scan}`,
@@ -435,7 +441,7 @@ get text #out`,
       const page = await context.newPage();
       await page.goto(fixtures.url("/ext-frame-sticky"));
       await page.locator("iframe").waitFor({ state: "attached" });
-      const tabId = await tabIdOf(page.url());
+      const tabId = await toolTabIdOf(alpha, page.url());
       const result = await call(alpha, `tab select ${tabId}\nget title`);
       expect(!result.isError, result.text);
       await call(alpha, `tab select ${alphaTab}`);
@@ -531,7 +537,10 @@ get text #out`,
             tabs.map((tab) => chrome.tabGroups.get(tab.groupId)),
           );
         },
-        [alphaTab, betaTab],
+        [
+          await chromeTabIdOf(alpha, alphaTab),
+          await chromeTabIdOf(beta, betaTab),
+        ],
       );
       expect(
         groups[0]!.title === "Smoke Alpha" && groups[1]!.title === "Smoke Beta",
@@ -874,6 +883,29 @@ async function tabCount() {
   });
 }
 
+/** The tool's ID for the tab at `url`, as `tab list` shows it. The daemon gives each browser's tabs IDs of its own, so they aren't Chrome's */
+async function toolTabIdOf(client: Client, url: string): Promise<number> {
+  const list = await call(client, "tab list");
+  const line = list.text
+    .split("\n")
+    .find((each) => each.includes(` — ${url}`));
+  const id = Number(/^.\s*(\d+)\s/.exec(line ?? "")?.[1]);
+  expect(id, `no tab for ${url} in:\n${list.text}`);
+  return id;
+}
+
+/** Chrome's own ID for a tab the tool calls `tabId`, for the extension's APIs */
+async function chromeTabIdOf(client: Client, tabId: number): Promise<number> {
+  const list = await call(client, "tab list");
+  const line = list.text
+    .split("\n")
+    .find((each) => new RegExp(`^.\\s*${tabId}\\s`).test(each));
+  const url = / — (\S+)/.exec(line ?? "")?.[1];
+  expect(url, `no tab ${tabId} in:\n${list.text}`);
+  return await tabIdOf(url!);
+}
+
+/** Chrome's own ID for the tab at `url` */
 async function tabIdOf(url: string) {
   return await inWorker(async (url) => {
     const { chrome } = globalThis as unknown as { chrome: Chrome };
