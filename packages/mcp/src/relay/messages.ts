@@ -16,6 +16,10 @@ export function rejectedExtensionMessage(extensionId: string): string {
   return `The extension ${extensionId} tried to connect but isn't allowed. If it's a development build, add its ID to BROWSER_MCP_EXTENSION_IDS (comma-separated) in the AI app's MCP config for @browsermcp/mcp and restart the AI app or reconnect the MCP server`;
 }
 
+export function noSuchBrowserMessage(browserId: string): string {
+  return `There's no browser ${browserId} connected to Browser MCP. Run \`browser list\``;
+}
+
 export function noSuchTabMessage(tabId: number): string {
-  return `There's no tab ${tabId} in the connected browser. Run \`tab list\``;
+  return `There's no tab ${tabId} in the connected browsers. Run \`tab list\``;
 }

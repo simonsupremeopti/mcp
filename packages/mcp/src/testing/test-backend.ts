@@ -61,3 +61,44 @@ export async function startTestBackend(
     },
   };
 }
+
+/** The backend's tab IDs by `<browser>:<extension tab ID>`: unique across browsers, so they aren't the extension's own */
+export function tabIdMap(backend: RelayBackend): Map<string, number> {
+  return (backend as unknown as { tabIds: Map<string, number> }).tabIds;
+}
+
+/** The backend's ID for a tab of a fake extension, waiting for the browser to report it. Browsers are `b1`, `b2`… in the order they first connect */
+export async function backendTabId(
+  backend: RelayBackend,
+  extensionTabId: number,
+  browserId = "b1",
+  timeoutMs = 5000,
+): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const id = tabIdMap(backend).get(`${browserId}:${extensionTabId}`);
+    if (id !== undefined) {
+      return id;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `The backend never reported tab ${extensionTabId} of ${browserId}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/** The extension's own ID for a tab the backend reports */
+export function extensionTabId(backend: RelayBackend, tabId: number): number {
+  const refs = (
+    backend as unknown as {
+      tabRefs: Map<number, { slotId: string; tabId: number }>;
+    }
+  ).tabRefs;
+  const ref = refs.get(tabId);
+  if (!ref) {
+    throw new Error(`No extension tab for backend tab ${tabId}`);
+  }
+  return ref.tabId;
+}

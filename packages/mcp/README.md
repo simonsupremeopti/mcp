@@ -36,7 +36,7 @@ AI app ──stdio──▶ thin process (dist/index.js, one per AI app)        
                     │                                             ▼ ws://127.0.0.1:<port>/cdp?token=…
                     ├─ CDP bridge: fakes Browser.* / Target.*           src/relay/bridge.ts
                     │                                             ▼ ws://127.0.0.1:<port>/extension
-                    └─ extension connection (one browser at a time)     src/relay/extension-connection.ts
+                    └─ extension connection (one per browser)           src/relay/extension-connection.ts
                                                      MV3 service worker ── chrome.debugger
 ```
 
@@ -73,7 +73,7 @@ AI app ──stdio──▶ thin process (dist/index.js, one per AI app)        
 `pnpm test` (Vitest). Tests never use ports 9009–9012 or `~/.browsermcp`: they take random ports and a temp `BROWSER_MCP_HOME`, and stop only the daemons they started.
 
 - `src/relay/server.test.ts`, `bridge.test.ts`: the endpoints and checks, and the bridge with an in-memory extension and CDP client.
-- `src/relay/backend.test.ts`, `integration.test.ts`: real Playwright through the bridge, with real headless Chromium standing in for the extension (pairing, one browser at a time, iframes, release and re-claim, a raw CDP session, Stop and Cancel, disconnects).
+- `src/relay/backend.test.ts`, `integration.test.ts`: real Playwright through the bridge, with real headless Chromium standing in for the extension (pairing, several browsers at once, iframes, release and re-claim, a raw CDP session, Stop and Cancel, disconnects).
 - `src/daemon/daemon.test.ts`, `src/thin/*.test.ts`: the daemon in-process and as real processes (started on demand, two thin processes at once, version replacement, idle exit, a killed daemon, ports held by other programs, relative file paths and MCP roots).
 - End to end, with the real extension: `pnpm --filter @browsermcp/extension smoke` (`@browsermcp/extension`'s `scripts/smoke-browser-control.ts`), which builds this package and runs `dist/index.js` over stdio.
 

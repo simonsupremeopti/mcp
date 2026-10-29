@@ -25,6 +25,7 @@ const EVERYDAY = [
 
 /** Named only; `help <command>` prints their syntax */
 export const MORE_COMMANDS = [
+  "browser",
   "scroll",
   "hover",
   "drag",

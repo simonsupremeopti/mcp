@@ -59,6 +59,10 @@ export interface StepContext {
   internalCdp(): Promise<CDPSession>;
   /** The agent's `cdp` session on the current tab */
   agentCdp(): Promise<NonNullable<TabState["cdp"]>>;
+  browsers: {
+    list(): string;
+    select(browserId: string): void;
+  };
   tabs: {
     list(): Promise<string>;
     create(url?: string): Promise<number>;
@@ -897,6 +901,23 @@ export const COMMANDS: CommandDef[] = [
       else if (sub === "close") {
         await ctx.tabs.close(ctx.args.positional[1] ? id() : undefined);
       } else throw new StepError("tab takes list, new, select or close");
+    },
+  },
+  {
+    name: "browser",
+    usage:
+      "browser list | browser select <browserId>   # only with several browsers connected",
+    help: "Lists the connected browsers (* marks the one your new tabs open in), or chooses which one `tab new` and `goto` open tabs in. Tab IDs are unique across browsers, so `tab select` needs no browser.",
+    noPage: true,
+    maxArgs: 2,
+    whileDialog: true,
+    async run(ctx) {
+      const sub = positional(ctx.args, 0, "list or select");
+      if (sub === "list") ctx.print(ctx.browsers.list());
+      else if (sub === "select") {
+        ctx.browsers.select(positional(ctx.args, 1, "<browserId>"));
+        ctx.note(`browser ${ctx.args.positional[1]!.text}`);
+      } else throw new StepError("browser takes list or select");
     },
   },
   {

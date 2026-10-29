@@ -389,8 +389,6 @@ export class RelayConnection {
         reason === RelayUpdateReason.updateExtension
           ? { state: "updateExtension" }
           : { state: "updateServer" };
-    } else if (code === RelayCloseCode.anotherBrowser) {
-      status = { state: "anotherBrowser" };
     } else if (this.#untrusted) {
       status = null;
     } else if (code === RelayCloseCode.shuttingDown || wasWelcomed) {
@@ -399,10 +397,7 @@ export class RelayConnection {
     if (status) {
       await this.#options.setStatus(status);
     }
-    // The daemon chose another browser: retrying at once would take it back, and two idle browsers would flip-flop. The watchdog (30 s) or the popup opening (`connectNow()`) tries again
-    if (code !== RelayCloseCode.anotherBrowser) {
-      this.#scheduleRetry();
-    }
+    this.#scheduleRetry();
   }
 
   #send(ws: WebSocket | null, message: ExtensionMessage): void {

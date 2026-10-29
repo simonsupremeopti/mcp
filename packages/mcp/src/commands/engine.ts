@@ -66,6 +66,8 @@ type Session = SessionInfo & {
   pending: number | null;
   /** Tabs the session uses */
   tabs: Set<number>;
+  /** The browser `tab new` and `goto` open tabs in (`browser select`), or null for the first usable one */
+  browser: string | null;
   /** Tabs the session (or its pages) opened, which `tab close` may close */
   opened: Set<number>;
   lastCall: number;
@@ -141,6 +143,7 @@ class Engine implements CommandEngine {
       current: null,
       pending: null,
       tabs: new Set(),
+      browser: null,
       opened: new Set(),
       lastCall: Date.now(),
       openedTabs: [],
@@ -500,10 +503,25 @@ class Engine implements CommandEngine {
         state.cdp ??= newCdpState(await this.backend.cdpSession(state.tabId));
         return state.cdp;
       },
+      browsers: {
+        list: () => this.listBrowsers(session),
+        select: (browserId) => {
+          const browsers = this.backend.browsers?.() ?? [];
+          if (!browsers.some((browser) => browser.id === browserId)) {
+            throw new StepError(
+              `There's no browser ${browserId}. Run \`browser list\``,
+            );
+          }
+          session.browser = browserId;
+        },
+      },
       tabs: {
         list: () => this.listTabs(session),
         create: async (url) => {
-          const tabId = await this.backend.createTab({ app: session.app });
+          const tabId = await this.backend.createTab({
+            app: session.app,
+            browser: session.browser ?? undefined,
+          });
           this.adopt(session, tabId, true);
           if (url) {
             const page = (await this.tabState(session)).page;
@@ -613,9 +631,28 @@ class Engine implements CommandEngine {
     return state;
   }
 
+  /** `browser list`: the connected browsers, `*` marking the one this session's new tabs open in */
+  private listBrowsers(session: Session): string {
+    const browsers = this.backend.browsers?.() ?? [];
+    if (!browsers.length) return "(no browsers)";
+    const current = session.browser ?? browsers.find((b) => !b.paused)?.id;
+    return browsers
+      .map((browser) => {
+        const marks = [
+          browser.pairing === "pending" ? "waiting for Allow" : undefined,
+          browser.paused ? "paused" : undefined,
+          browser.inUse ? "in use" : undefined,
+        ].filter(Boolean);
+        return `${browser.id === current ? "*" : " "} ${browser.id} ${browser.name} ${browser.version} — ${browser.tabs} tab${browser.tabs === 1 ? "" : "s"}${marks.length ? ` (${marks.join(", ")})` : ""}`;
+      })
+      .join("\n");
+  }
+
   private async listTabs(session: Session): Promise<string> {
     const tabs = this.backend.tabs();
     if (!tabs.length) return "(no tabs)";
+    // Only with several browsers connected, so single-browser output is unchanged
+    const named = new Set(tabs.map((tab) => tab.browser)).size > 1;
     const current = this.currentTab(session);
     // The extension reports titles and URLs a moment after they change, so tabs agents use show their page's own
     const live = await Promise.all(
@@ -629,6 +666,7 @@ class Engine implements CommandEngine {
           title: live[i]?.title || reported.title,
         };
         const marks = [
+          named && tab.browser ? tab.browser : undefined,
           session.tabs.has(tab.tabId) ? "yours" : undefined,
           tab.active ? "active" : undefined,
         ].filter(Boolean);

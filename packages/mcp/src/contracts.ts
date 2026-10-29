@@ -17,6 +17,24 @@ import type { AppInfo, ExposedTab } from "@browsermcp/protocol";
 
 export type { AppInfo, ExposedTab };
 
+/** A tab as the engine sees it: its ID is unique across the connected browsers, and `browser` names the one it's in (`BrowserSummary.id`) */
+export type BackendTab = ExposedTab & { browser?: string };
+
+/** A connected browser, for `browser list` */
+export type BrowserSummary = {
+  /** Short, stable while the browser stays connected, e.g. `b1`. A browser whose service worker restarts keeps it */
+  id: string;
+  /** e.g. `Chrome` */
+  name: string;
+  version: string;
+  /** How many tabs it exposes */
+  tabs: number;
+  paused: boolean;
+  pairing: "paired" | "pending";
+  /** An agent is using one of its tabs */
+  inUse: boolean;
+};
+
 // --- Daemon ↔ thin process (`WS /client?token=`) ---
 
 /** Bumped on breaking changes between the thin process and the daemon. A thin process newer than the daemon replaces it (`POST /shutdown`) */
@@ -107,13 +125,20 @@ export interface BrowserBackend {
   whenReady?(): Promise<void>;
   /** The user pressed Stop (or Cancel on the debugging bar) */
   readonly paused: boolean;
-  /** The tabs the extension reports */
-  tabs(): ExposedTab[];
-  /** The tab the extension reports with this ID, waiting briefly for one it doesn't list yet: it reports a new tab a moment after it appears */
-  findTab(tabId: number): Promise<ExposedTab | undefined>;
+  /** The tabs the connected browsers report, with IDs unique across them */
+  tabs(): BackendTab[];
+  /** The tab with this ID, waiting briefly for a browser to report one it doesn't list yet: a browser reports a new tab a moment after it appears */
+  findTab(tabId: number): Promise<BackendTab | undefined>;
+  /** The connected browsers, newest last. Absent on backends that only ever drive one */
+  browsers?(): BrowserSummary[];
 
   /** Opens a background tab in the app's group. Doesn't attach the debugger */
-  createTab(options: { url?: string; app: AppInfo }): Promise<number>;
+  createTab(options: {
+    url?: string;
+    app: AppInfo;
+    /** Which browser to open it in; the first usable one by default */
+    browser?: string;
+  }): Promise<number>;
   closeTab(tabId: number): Promise<void>;
   activateTab(tabId: number): Promise<void>;
   /** Puts a tab in the app's group, or out of any with `null` */
@@ -139,7 +164,7 @@ export interface BrowserBackend {
 
 export type BackendEvents = {
   /** The tab list or `paused` changed */
-  state: { tabs: ExposedTab[]; paused: boolean; pairing: "paired" | "pending" };
+  state: { tabs: BackendTab[]; paused: boolean; pairing: "paired" | "pending" };
   /** The user dragged a tab into an app's group, or out of it */
   tabAssigned: { tabId: number; appId: string | null };
   /** A page opened a tab */

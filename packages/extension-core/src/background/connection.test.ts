@@ -348,29 +348,20 @@ describe("the connection to the daemon", () => {
     },
   );
 
-  it("after the daemon chose another browser (4002), tries again only from the watchdog or the popup, so two browsers don't take turns", async () => {
+  it("retries after an older daemon closes it for another browser (4002)", async () => {
     const { connection, statuses } = setup({ 9010: "daemon" });
     connection.ensureRunning();
     await vi.advanceTimersByTimeAsync(0);
     const ws = FakeWebSocket.latest("9010")!;
     ws.open();
     await vi.advanceTimersByTimeAsync(0);
+    // Only a daemon that accepts one browser sends this; it's no longer terminal
     ws.serverClose(RelayCloseCode.anotherBrowser);
     await vi.advanceTimersByTimeAsync(0);
-    expect(statuses.at(-1)).toEqual({ state: "anotherBrowser" });
+    expect(statuses.at(-1)).toEqual({ state: "searching" });
 
-    await vi.advanceTimersByTimeAsync(20_000);
-    expect(FakeWebSocket.instances).toHaveLength(1);
-
-    connection.watchdog();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(FakeWebSocket.instances).toHaveLength(2);
-
-    FakeWebSocket.latest("9010")!.serverClose(RelayCloseCode.anotherBrowser);
-    await vi.advanceTimersByTimeAsync(0);
-    connection.connectNow();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(FakeWebSocket.instances).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(FakeWebSocket.instances.length).toBeGreaterThan(1);
   });
 
   it("asks to update the server or the extension when the status's protocol doesn't match, without connecting", async () => {

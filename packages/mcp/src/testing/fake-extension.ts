@@ -373,6 +373,17 @@ export class FakeExtension {
     return (await this.tabForTarget(targetId)).tabId;
   }
 
+  /** Opens a tab and names an existing one as its opener, as a page's `window.open` does */
+  async openTabFrom(openerTabId: number, url: string): Promise<number> {
+    const tabId = await this.openTab(url);
+    const tab = this.tabs.get(tabId);
+    if (tab) {
+      tab.appId = this.tabs.get(openerTabId)?.appId;
+    }
+    this.event({ type: "tabOpened", data: { tabId, openerTabId, url } });
+    return tabId;
+  }
+
   /** Clicks **Allow** in the popup */
   allow() {
     this.pairing = "paired";

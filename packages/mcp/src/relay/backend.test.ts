@@ -20,13 +20,16 @@ import {
 import type { BackendEvents } from "@/contracts";
 import type { CdpBridge } from "@/relay/bridge";
 import {
-  ANOTHER_BROWSER_MESSAGE,
   noSuchTabMessage,
   rejectedExtensionMessage,
   UPDATE_EXTENSION_MESSAGE,
 } from "@/relay/messages";
 import { FakeChromium, FakeExtension } from "@/testing/fake-extension";
-import { startTestBackend } from "@/testing/test-backend";
+import {
+  backendTabId,
+  startTestBackend,
+  tabIdMap,
+} from "@/testing/test-backend";
 
 let chromium: FakeChromium;
 let relay: Awaited<ReturnType<typeof startTestBackend>>;
@@ -44,15 +47,24 @@ async function connect(
   return extension;
 }
 
-/** The connected browser's slot, whose internals some tests reach into */
-function slot() {
+/** A connected browser's slot, whose internals some tests reach into. Browsers are `b1`, `b2`… in the order they first connect */
+function slot(browserId = "b1") {
   const current = (
-    relay.backend as unknown as { slot: BrowserSlotInternals | null }
-  ).slot;
+    relay.backend as unknown as { slots: Map<string, BrowserSlotInternals> }
+  ).slots.get(browserId);
   if (!current) {
-    throw new Error("No browser is connected");
+    throw new Error(`Browser ${browserId} isn't connected`);
   }
   return current;
+}
+
+/** The ID the backend gives one of a browser's tabs: unique across browsers, so it isn't the extension's own tab ID */
+function tabIdIn(browserId: string, extensionTabId: number) {
+  const id = tabIdMap(relay.backend).get(`${browserId}:${extensionTabId}`);
+  if (id === undefined) {
+    throw new Error(`No backend ID for tab ${extensionTabId} of ${browserId}`);
+  }
+  return id;
 }
 
 type BrowserSlotInternals = {
@@ -71,7 +83,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  relay = await startTestBackend({ replacePingTimeoutMs: 500 });
+  relay = await startTestBackend();
 });
 
 afterEach(async () => {
@@ -218,117 +230,95 @@ describe("RelayBackend", () => {
     expect(relay.backend.unavailableReason()).toBe(UPDATE_EXTENSION_MESSAGE);
   });
 
-  it("lets a second browser replace an idle one", async () => {
+  it("keeps both browsers connected, with tab IDs of their own", async () => {
     const first = await connect();
     const second = await connect();
-    expect(await first.closed).toMatchObject({
-      code: RelayCloseCode.anotherBrowser,
-    });
-    expect(relay.backend.connected).toBe(true);
-    // The second one is the browser now
-    const tabId = [...second.tabs.keys()][0]!;
-    await slot().bridge.claim(tabId);
+    expect(first.closed).toBeInstanceOf(Promise);
+    expect(relay.backend.browsers().map((browser) => browser.id)).toEqual([
+      "b1",
+      "b2",
+    ]);
+    const firstTab = tabIdIn("b1", [...first.tabs.keys()][0]!);
+    const secondTab = tabIdIn("b2", [...second.tabs.keys()][0]!);
+    expect(firstTab).not.toBe(secondTab);
+    // Each ID reaches only its own browser
+    await relay.backend.activateTab(secondTab);
+    expect(second.requests.at(-1)?.method).toBe("activateTab");
+    expect(
+      first.requests.some((request) => request.method === "activateTab"),
+    ).toBe(false);
+  });
+
+  it("lets another browser connect while an agent uses a tab in the first", async () => {
+    const first = await connect();
+    const extensionTabId = [...first.tabs.keys()][0]!;
+    await slot().bridge.claim(extensionTabId);
+    const second = await connect();
+    expect(relay.backend.browsers()).toHaveLength(2);
+    expect(relay.backend.isClaimed(tabIdIn("b1", extensionTabId))).toBe(true);
+    expect(first.requests.at(-1)?.method).toBe("attach");
     expect(second.requests.some((request) => request.method === "attach")).toBe(
-      true,
+      false,
     );
   });
 
-  it("refuses a second browser while an agent uses a tab in the first", async () => {
+  it("gives a browser its slot and tab IDs back when its service worker restarts", async () => {
     const first = await connect();
-    const tabId = [...first.tabs.keys()][0]!;
-    await slot().bridge.claim(tabId);
-    const second = await connect();
-    expect(await second.closed).toMatchObject({
-      code: RelayCloseCode.anotherBrowser,
+    const extensionTabId = [...first.tabs.keys()][0]!;
+    const before = tabIdIn("b1", extensionTabId);
+    await relay.backend.groupTab(before, {
+      id: "claude-code",
+      name: "Claude Code",
     });
-    expect(relay.backend.isClaimed(tabId)).toBe(true);
-    expect(first.requests.at(-1)?.method).toBe("attach");
-  });
-
-  it("doesn't let a replaced browser take the connection back when it retries", async () => {
-    const first = await connect();
-    const second = await connect();
-    expect(await first.closed).toMatchObject({
-      code: RelayCloseCode.anotherBrowser,
-    });
-    // The first browser retries (same browser: same user agent and windows)
-    const retry = await connect();
-    expect(await retry.closed).toMatchObject({
-      code: RelayCloseCode.anotherBrowser,
-    });
-    // A third browser still replaces an idle one
-    await connect({ userAgent: "Another browser" });
-    expect(await second.closed).toMatchObject({
-      code: RelayCloseCode.anotherBrowser,
-    });
-  });
-
-  it("lets a replaced browser back once the browser that replaced it goes away", async () => {
-    await connect();
-    const second = await connect();
-    await second.disconnect();
+    await first.disconnect();
     await vi.waitUntil(() => !relay.backend.connected);
     await connect();
-    expect(relay.backend.connected).toBe(true);
+    expect(relay.backend.browsers().map((browser) => browser.id)).toEqual([
+      "b1",
+    ]);
+    expect(tabIdIn("b1", extensionTabId)).toBe(before);
+    await expect(relay.backend.activateTab(before)).resolves.toBeUndefined();
   });
 
   it("counts a browser as in use while a tab an agent selected there is open, even unclaimed", async () => {
     const first = await connect();
-    const tabId = [...first.tabs.keys()][0]!;
+    const tabId = tabIdIn("b1", [...first.tabs.keys()][0]!);
     await relay.backend.groupTab(tabId, {
       id: "claude-code",
       name: "Claude Code",
     });
     expect(relay.backend.isClaimed(tabId)).toBe(false);
-    const second = await connect({ userAgent: "Another browser" });
-    expect(await second.closed).toMatchObject({
-      code: RelayCloseCode.anotherBrowser,
-    });
+    expect(relay.backend.browsers()[0]?.inUse).toBe(true);
   });
 
   it("doesn't count tabs agents used once no session is open", async () => {
     await relay.close();
-    relay = await startTestBackend({
-      replacePingTimeoutMs: 500,
-      hasSessions: () => false,
-    });
+    relay = await startTestBackend({ hasSessions: () => false });
     const first = await connect();
-    const tabId = [...first.tabs.keys()][0]!;
+    const tabId = tabIdIn("b1", [...first.tabs.keys()][0]!);
     await relay.backend.groupTab(tabId, {
       id: "claude-code",
       name: "Claude Code",
     });
-    await connect({ userAgent: "Another browser" });
-    expect(await first.closed).toMatchObject({
-      code: RelayCloseCode.anotherBrowser,
-    });
+    expect(relay.backend.browsers()[0]?.inUse).toBe(false);
   });
 
-  it("refuses tab IDs agents used in another browser until one is selected again", async () => {
+  it("keeps another browser's tabs under IDs of their own", async () => {
     const app = { id: "claude-code", name: "Claude Code" };
     const first = await connect();
-    const tabId = [...first.tabs.keys()][0]!;
-    await relay.backend.groupTab(tabId, app);
-    await first.disconnect();
-    // The same browser back (its service worker restarted) keeps its tabs
-    await connect();
-    await expect(relay.backend.activateTab(tabId)).resolves.toBeUndefined();
-    await extensions.pop()!.disconnect();
+    const extensionTabId = [...first.tabs.keys()][0]!;
+    const firstTab = tabIdIn("b1", extensionTabId);
+    await relay.backend.groupTab(firstTab, app);
 
-    // Another browser, whose tab with the same ID is another tab
-    await connect({ userAgent: "Another browser" });
-    await expect(relay.backend.activateTab(tabId)).rejects.toThrow(
-      ANOTHER_BROWSER_MESSAGE,
-    );
-    await expect(relay.backend.page(tabId)).rejects.toThrow(
-      ANOTHER_BROWSER_MESSAGE,
-    );
-    await expect(relay.backend.closeTab(tabId)).rejects.toThrow(
-      ANOTHER_BROWSER_MESSAGE,
-    );
-    // `tab select` groups it in this browser
-    await relay.backend.groupTab(tabId, app);
-    await expect(relay.backend.activateTab(tabId)).resolves.toBeUndefined();
+    // Another browser, whose tab with the same extension tab ID is another tab
+    const second = await connect({ userAgent: "Another browser" });
+    const secondTab = tabIdIn("b2", [...second.tabs.keys()][0]!);
+    expect(secondTab).not.toBe(firstTab);
+    await relay.backend.activateTab(secondTab);
+    expect(second.requests.at(-1)?.method).toBe("activateTab");
+    expect(
+      first.requests.some((request) => request.method === "activateTab"),
+    ).toBe(false);
   });
 
   it("refuses tabs the connected browser doesn't report", async () => {
@@ -338,40 +328,21 @@ describe("RelayBackend", () => {
     );
   });
 
-  it("finds a tab the extension reports a moment after it appears", async () => {
-    // The real extension sends `state` 100 ms after a change
-    const extension = await connect({ stateDelayMs: 150 });
-    const tabId = await extension.openTab("about:blank");
+  it("finds a tab a browser reports a moment after `tabOpened` names it", async () => {
+    // The real extension sends `state` 100 ms after a change, but names an opened tab at once
+    const extension = await connect({ stateDelayMs: 300 });
+    const opener = [...extension.tabs.keys()][0]!;
+    const opened = await extension.openTabFrom(opener, "about:blank");
+    const tabId = await backendTabId(relay.backend, opened);
     expect(relay.backend.tabs().map((tab) => tab.tabId)).not.toContain(tabId);
     expect((await relay.backend.findTab(tabId))?.tabId).toBe(tabId);
   });
 
-  it("doesn't find a tab the extension never reports", async () => {
+  it("doesn't find a tab no browser ever reports", async () => {
     await relay.close();
-    relay = await startTestBackend({
-      replacePingTimeoutMs: 500,
-      unknownTabWaitMs: 100,
-    });
+    relay = await startTestBackend({ unknownTabWaitMs: 100 });
     await connect();
     await expect(relay.backend.findTab(987_654)).resolves.toBeUndefined();
-  });
-
-  it("doesn't adopt a contender that left while the current browser was pinged", async () => {
-    const first = await connect();
-    const tabId = [...first.tabs.keys()][0]!;
-    await slot().bridge.claim(tabId);
-    first.answering = false;
-    const connections: boolean[] = [];
-    relay.backend.on("connection", ({ connected }) =>
-      connections.push(connected),
-    );
-    const second = await connect();
-    await second.disconnect();
-    // The ping times out after 500 ms; the contender is gone by then
-    await new Promise((resolve) => setTimeout(resolve, 700));
-    expect(connections).toEqual([]);
-    expect(relay.backend.isClaimed(tabId)).toBe(true);
-    first.answering = true;
   });
 
   it("times out requests the extension doesn't answer, forgetting them", async () => {
@@ -379,7 +350,7 @@ describe("RelayBackend", () => {
     relay = await startTestBackend({ requestTimeoutMs: 200 });
     const extension = await connect();
     extension.answering = false;
-    const tabId = [...extension.tabs.keys()][0]!;
+    const tabId = tabIdIn("b1", [...extension.tabs.keys()][0]!);
     await expect(relay.backend.activateTab(tabId)).rejects.toThrow(
       "The browser didn't answer activateTab in time",
     );
@@ -438,8 +409,9 @@ describe("RelayBackend", () => {
     const extension = await connect();
     const assigned: BackendEvents["tabAssigned"][] = [];
     relay.backend.on("tabAssigned", (event) => assigned.push(event));
-    const tabId = [...extension.tabs.keys()][0]!;
-    extension.assign(tabId, "cursor");
+    const extensionTabId = [...extension.tabs.keys()][0]!;
+    const tabId = tabIdIn("b1", extensionTabId);
+    extension.assign(extensionTabId, "cursor");
     await vi.waitUntil(() => assigned.length === 1);
     expect(assigned[0]).toEqual({ tabId, appId: "cursor" });
 

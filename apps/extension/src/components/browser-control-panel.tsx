@@ -205,9 +205,7 @@ function ConnectionAlert({
         Waiting for the {APP_NAME} server
       </p>
       <p className="ps-4 text-muted-foreground">
-        {connection.state === "anotherBrowser"
-          ? "An AI app is using a tab in that browser. This one connects once it's free."
-          : `Start an AI app that uses ${APP_NAME}. The extension connects on its own.`}
+        {`Start an AI app that uses ${APP_NAME}. The extension connects on its own.`}
       </p>
     </div>
   );

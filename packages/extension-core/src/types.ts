@@ -62,9 +62,7 @@ export type ConnectionStatus =
   /** The daemon's protocol is older than the extension's */
   | { state: "updateServer"; daemonVersion?: string }
   /** The daemon's protocol is newer than the extension's */
-  | { state: "updateExtension"; daemonVersion?: string }
-  /** Another browser or profile holds the daemon's connection (close code 4002) */
-  | { state: "anotherBrowser" };
+  | { state: "updateExtension"; daemonVersion?: string };
 
 /** An AI app using the browser, with its tabs, for the popup */
 export type BrowserControlApp = {

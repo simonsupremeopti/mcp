@@ -66,7 +66,7 @@ type Daemon = { publicKey: string; code: string | null; paired: boolean };
 /**
  * What browser control reports through `onEvent`, e.g. for usage analytics:
  * - `daemon connected`: `{ protocol, daemonVersion, paired }`, on each connection to a daemon that proved its key
- * - `daemon connection failed`: `{ reason, daemonVersion? }`, when the connection's status turns into a failure (`updateServer`, `updateExtension`, `anotherBrowser`, `untrusted`) or a 0.1.x server is found (`outdatedServer`). Once per change, not per retry
+ * - `daemon connection failed`: `{ reason, daemonVersion? }`, when the connection's status turns into a failure (`updateServer`, `updateExtension`, `untrusted`) or a 0.1.x server is found (`outdatedServer`). Once per change, not per retry
  * - `daemon paired`: the user clicked **Allow**
  */
 export type BrowserControlEvent =
