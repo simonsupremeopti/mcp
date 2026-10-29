@@ -18,6 +18,8 @@ const ALLOWED_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
 export type RelayServerOptions = {
   /** Required on `/cdp`, `/client` and `/shutdown` */
   token: string;
+  /** The address to bind, `127.0.0.1` by default. Requests naming another host are still refused, against DNS rebinding */
+  host?: string;
   version: string;
   /** Chrome extension IDs allowed on `/extension`; anything with `has` is asked on each connection, so the daemon can add to it */
   extensionIds: readonly string[] | { has(id: string): boolean };
@@ -53,9 +55,10 @@ export class RelayServer {
     options: RelayServerOptions,
   ): Promise<RelayServer> {
     const server = http.createServer();
+    const host = options.host ?? RELAY_HOST;
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen({ port, host: RELAY_HOST, exclusive: true }, () => {
+      server.listen({ port, host, exclusive: true }, () => {
         server.off("error", reject);
         resolve();
       });
@@ -80,11 +83,12 @@ export class RelayServer {
 
   private handle(options: RelayServerOptions) {
     const { log } = options;
+    const allowedHost = options.host;
     const hasToken = (url: URL) =>
       safeEqual(url.searchParams.get("token") ?? "", options.token);
 
     this.server.on("request", (request, response) => {
-      if (!isAllowedHost(request.headers.host)) {
+      if (!isAllowedHost(request.headers.host, allowedHost)) {
         response.writeHead(403).end();
         return;
       }
@@ -128,7 +132,7 @@ export class RelayServer {
 
     this.server.on("upgrade", (request, socket, head) => {
       const reject = (status: number) => rejectUpgrade(socket, status);
-      if (!isAllowedHost(request.headers.host)) {
+      if (!isAllowedHost(request.headers.host, allowedHost)) {
         reject(403);
         return;
       }
@@ -178,12 +182,20 @@ export class RelayServer {
 }
 
 /** Against DNS rebinding: a page on `evil.example` rebound to 127.0.0.1 still sends its own Host */
-export function isAllowedHost(host: string | undefined): boolean {
+export function isAllowedHost(
+  host: string | undefined,
+  /** The address the daemon binds, when that isn't loopback */
+  allowedHost?: string,
+): boolean {
   if (!host) {
     return false;
   }
+  // An IPv6 host is `[::1]:9010`; only a trailing `:port` is stripped
   const hostname = host.toLowerCase().replace(/:\d+$/, "");
-  return ALLOWED_HOSTNAMES.has(hostname);
+  return (
+    ALLOWED_HOSTNAMES.has(hostname) ||
+    (!!allowedHost && hostname === allowedHost.toLowerCase())
+  );
 }
 
 export function isAllowedExtensionOrigin(

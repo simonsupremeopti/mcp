@@ -51,6 +51,8 @@ export type DaemonIdentity = {
 /** `~/.browsermcp/daemon.json` (directory 0700, file 0600), written by the daemon once it listens */
 export type DaemonInfo = {
   port: number;
+  /** The address it listens on, when that isn't `127.0.0.1` (`--host`). Its own clients dial it there too */
+  host?: string;
   pid: number;
   /** The daemon's package version */
   version: string;

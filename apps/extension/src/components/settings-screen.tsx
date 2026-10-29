@@ -11,7 +11,7 @@ import { RELAY_PORTS, isValidRelayPort } from "@browsermcp/protocol";
 import { Button, ErrorAlert } from "./ui";
 
 /**
- * The popup's settings: only the port of a server started with `--port`. Add a setting only when users can't do without it, since each one is more for every user to read
+ * The popup's settings: the port of a server started with `--port`, and, for a server on another machine (`--host`), its address and join token. Add a setting only when users can't do without it, since each one is more for every user to read
  */
 export function SettingsScreen({ onBack }: { onBack: () => void }) {
   const [view, refresh] = useBrowserControl();
@@ -50,6 +50,34 @@ export function SettingsScreen({ onBack }: { onBack: () => void }) {
               run(() => sendBrowserControlMessage("setRelayPort", { port }))
             }
           />
+        </div>
+      )}
+      {view && (
+        <div className="space-y-3 border-t px-4 py-3">
+          <TextSetting
+            key={`host-${view.relayHost ?? "local"}`}
+            id="settings-host"
+            label="Server address"
+            placeholder="This computer"
+            initial={view.relayHost ?? ""}
+            help="Only if the server runs on another machine with --host. Enter the address it listens on."
+            onSave={(host) =>
+              run(() => sendBrowserControlMessage("setRelayHost", { host }))
+            }
+          />
+          {view.relayHost && (
+            <TextSetting
+              key={`token-${view.hasJoinToken}`}
+              id="settings-token"
+              label="Join token"
+              placeholder={view.hasJoinToken ? "Saved" : "From the server"}
+              initial=""
+              help="A server on another machine only drives browsers you allowed. Paste its join token once."
+              onSave={(token) =>
+                run(() => sendBrowserControlMessage("setJoinToken", { token }))
+              }
+            />
+          )}
         </div>
       )}
     </div>
@@ -125,6 +153,54 @@ function PortSetting({
           Use default ports
         </Button>
       )}
+    </form>
+  );
+}
+
+/** A one-line setting saved as text, or null when empty */
+function TextSetting({
+  id,
+  label,
+  placeholder,
+  initial,
+  help,
+  onSave,
+}: {
+  id: string;
+  label: string;
+  placeholder: string;
+  initial: string;
+  help: string;
+  onSave: (value: string | null) => void;
+}) {
+  const [value, setValue] = useState(initial);
+
+  const save = (event: FormEvent) => {
+    event.preventDefault();
+    onSave(value.trim() || null);
+  };
+
+  return (
+    <form onSubmit={save} className="space-y-2">
+      <label htmlFor={id} className="block font-medium">
+        {label}
+      </label>
+      <div className="flex gap-2">
+        <input
+          id={id}
+          className="h-8 w-full min-w-0 rounded-md border border-input bg-transparent px-2.5 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          placeholder={placeholder}
+          value={value}
+          aria-describedby={`${id}-help`}
+          onChange={(event) => setValue(event.target.value)}
+        />
+        <Button type="submit" variant="outline">
+          Save
+        </Button>
+      </div>
+      <p id={`${id}-help`} className="text-xs text-muted-foreground">
+        {help}
+      </p>
     </form>
   );
 }

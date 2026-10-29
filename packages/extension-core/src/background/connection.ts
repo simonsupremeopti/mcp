@@ -16,6 +16,7 @@ import {
 } from "@browsermcp/protocol";
 
 import type { ConnectionStatus } from "../types";
+import { hostForUrl } from "../url";
 import { createChallenge, getPairingCode } from "./pairing";
 
 export type Hello = Extract<ExtensionMessage, { type: "hello" }>;
@@ -33,24 +34,32 @@ const LEGACY_WEBSOCKET_RETRY_MS = 60_000;
 /** The close code the extension uses for a daemon whose signature didn't verify */
 const UNTRUSTED_CLOSE_CODE = 4900;
 
+/** Where to look for the daemon: a port on this machine, or on the host set in the extension's settings */
+export type RelayEndpoint = { host: string; port: number };
+
 export type RelayConnectionOptions = {
-  /** The ports to probe, in order (`RELAY_PORTS`, or the one set in storage) */
-  getPorts: () => Promise<readonly number[]>;
+  /** The endpoints to probe, in order (`RELAY_PORTS` on 127.0.0.1, or the host and port set in storage) */
+  getEndpoints: () => Promise<readonly RelayEndpoint[]>;
   /** Where to look for a 0.1.x server: `LEGACY_PORT`, or in development and test builds the one set in storage (the smoke test's fake 0.1.x server) */
   getLegacyPort?: () => Promise<number>;
   createHello: (challenge: string) => Promise<Hello>;
-  /** Whether `welcome` signs `challenge`, the port the extension dialed and its `pairingCommitment` with the key it names */
+  /** Whether `welcome` signs `challenge`, the host and port the extension dialed and its `pairingCommitment` with the key it names */
   verifyWelcome: (
     welcome: Welcome,
     challenge: string,
-    port: number,
+    endpoint: RelayEndpoint,
   ) => Promise<boolean>;
+  /** The daemon isn't on loopback and asked this browser to prove its key (`welcome.authChallenge`) */
+  createBrowserAuth?: (
+    endpoint: RelayEndpoint,
+    challenge: string,
+  ) => Promise<ExtensionMessage>;
   /** Whether the user allowed this daemon key (base64 SPKI). For a key they didn't, the extension exchanges nonces with the daemon for the pairing code */
   isPaired: (publicKey: string) => Promise<boolean>;
   /** The daemon proved its key. Sets the status (`connected`, paired or not). `code`: the six-digit pairing code for a key the user didn't allow yet, else null */
   onWelcome: (
     welcome: Welcome,
-    port: number,
+    endpoint: RelayEndpoint,
     code: string | null,
   ) => Promise<void>;
   onRequest: (request: ExtensionRequest) => Promise<unknown>;
@@ -170,8 +179,8 @@ export class RelayConnection {
     try {
       void this.#probeLegacy();
       let outcome: ConnectionStatus = { state: "searching" };
-      for (const port of await this.#options.getPorts()) {
-        const status = await this.#probe(port);
+      for (const endpoint of await this.#options.getEndpoints()) {
+        const status = await this.#probe(endpoint);
         if (!status) {
           continue;
         }
@@ -180,7 +189,7 @@ export class RelayConnection {
         } else if (RELAY_PROTOCOL_VERSION < status.minProtocol) {
           outcome = { state: "updateExtension", daemonVersion: status.version };
         } else {
-          this.#open(port);
+          this.#open(endpoint);
           return;
         }
         break;
@@ -208,10 +217,10 @@ export class RelayConnection {
     }, delay);
   }
 
-  async #probe(port: number): Promise<RelayStatus | null> {
+  async #probe({ host, port }: RelayEndpoint): Promise<RelayStatus | null> {
     try {
       const response = await this.#fetchWithTimeout(
-        `http://127.0.0.1:${port}${RelayPaths.status}`,
+        `http://${hostForUrl(host)}:${port}${RelayPaths.status}`,
       );
       if (!response.ok) {
         return null;
@@ -227,10 +236,10 @@ export class RelayConnection {
     }
   }
 
-  #open(port: number): void {
+  #open(endpoint: RelayEndpoint): void {
     const challenge = createChallenge();
     const ws = new this.#WebSocket(
-      `ws://127.0.0.1:${port}${RelayPaths.extension}`,
+      `ws://${hostForUrl(endpoint.host)}:${endpoint.port}${RelayPaths.extension}`,
     );
     this.#socket = ws;
     this.#welcomed = false;
@@ -259,14 +268,17 @@ export class RelayConnection {
       } else if (message.type === "welcome") {
         clearTimeout(welcomeTimer);
         // Never rejects, so requests still get answers (errors) when handling `welcome` failed
-        this.#ready = this.#handleWelcome(ws, port, message, challenge).catch(
-          (error: unknown) => {
-            console.error(
-              "Couldn't handle the Browser MCP server's welcome",
-              error,
-            );
-          },
-        );
+        this.#ready = this.#handleWelcome(
+          ws,
+          endpoint,
+          message,
+          challenge,
+        ).catch((error: unknown) => {
+          console.error(
+            "Couldn't handle the Browser MCP server's welcome",
+            error,
+          );
+        });
       } else if (message.type === "pairingReveal") {
         this.#revealWaiter?.(message.nonce);
       } else if (message.type === "request") {
@@ -281,16 +293,31 @@ export class RelayConnection {
 
   async #handleWelcome(
     ws: WebSocket,
-    port: number,
+    endpoint: RelayEndpoint,
     welcome: Welcome,
     challenge: string,
   ): Promise<void> {
-    if (!(await this.#options.verifyWelcome(welcome, challenge, port))) {
+    // A daemon off loopback names the host it listens on, which has to be the one dialed
+    if (welcome.host !== undefined && welcome.host !== endpoint.host) {
+      await this.#distrust(ws, "The server named another host");
+      return;
+    }
+    if (!(await this.#options.verifyWelcome(welcome, challenge, endpoint))) {
       await this.#distrust(ws, "The signature didn't verify");
       return;
     }
     if (this.#socket !== ws) {
       return;
+    }
+    // Before any other frame: the daemon waits for it before the connection is usable
+    if (welcome.authChallenge && this.#options.createBrowserAuth) {
+      this.#send(
+        ws,
+        await this.#options.createBrowserAuth(endpoint, welcome.authChallenge),
+      );
+      if (this.#socket !== ws) {
+        return;
+      }
     }
     let code: string | null = null;
     if (!(await this.#options.isPaired(welcome.publicKey))) {
@@ -309,7 +336,7 @@ export class RelayConnection {
     }
     this.#welcomed = true;
     this.#attempt = 0;
-    await this.#options.onWelcome(welcome, port, code);
+    await this.#options.onWelcome(welcome, endpoint, code);
   }
 
   /**
@@ -389,6 +416,8 @@ export class RelayConnection {
         reason === RelayUpdateReason.updateExtension
           ? { state: "updateExtension" }
           : { state: "updateServer" };
+    } else if (code === RelayCloseCode.notAuthorized) {
+      status = { state: "notAuthorized", message: reason };
     } else if (this.#untrusted) {
       status = null;
     } else if (code === RelayCloseCode.shuttingDown || wasWelcomed) {

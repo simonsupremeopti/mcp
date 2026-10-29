@@ -11,6 +11,7 @@
  * ```
  */
 import { type ChildProcess, spawn } from "node:child_process";
+import { generateKeyPairSync, sign as nodeSign } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -29,12 +30,31 @@ import {
   PAIRING_KEY_ALGORITHM,
   RELAY_PROTOCOL_VERSION,
   RelayPaths,
+  browserAuthPayload,
   createPairingNonce,
   pairingCode,
   pairingCommitment,
   pairingPayload,
   pairingRequiredMessage,
 } from "@browsermcp/protocol";
+
+/** A browser key pair, as the extension's WebCrypto makes one on first use */
+export function createBrowserKey(): {
+  key: string;
+  sign(payload: string): string;
+} {
+  const { publicKey, privateKey } = generateKeyPairSync("ec", {
+    namedCurve: "prime256v1",
+  });
+  return {
+    key: publicKey.export({ type: "spki", format: "der" }).toString("base64"),
+    sign: (payload) =>
+      nodeSign("sha256", Buffer.from(payload, "utf8"), {
+        key: privateKey,
+        dsaEncoding: "ieee-p1363",
+      }).toString("base64"),
+  };
+}
 
 type CdpFrame = {
   id?: number;
@@ -187,6 +207,12 @@ export type FakeExtensionOptions = {
   pairing?: ExtensionState["pairing"];
   /** With `pairing: "pending"`, whether `connect()` sends `pairingNonce` and waits for the daemon's reveal. `false` stays pending without a code, as in the moment before the real extension sends its nonce. Default: true */
   pairingNonce?: boolean;
+  /** The join token to send in `browserAuth`, for a daemon off loopback that doesn't know this browser yet */
+  joinToken?: string;
+  /** This browser's key pair; a fresh one by default, as a browser that never connected before */
+  browserKey?: { key: string; sign(payload: string): string };
+  /** `false` never answers the daemon's `authChallenge`, as a browser too old to (or one stalling) */
+  browserAuth?: boolean;
   /** How long tab changes are gathered before `state` is sent (the real extension's is 100 ms). Default: 10 ms */
   stateDelayMs?: number;
   /** Sent in `hello`, to tell browsers apart. Default: the Chromium's */
@@ -214,6 +240,8 @@ export class FakeExtension {
   answering = true;
   /** The nonce it sent in `pairingNonce`, if it did */
   pairingNonce: string | null = null;
+  /** The key it proved in `browserAuth`, if the daemon asked */
+  browserKey: { key: string; sign(payload: string): string } | null = null;
   /** The daemon's nonce from `pairingReveal`, if it was revealed */
   daemonNonce: string | null = null;
   /** The code the popup would show next to **Allow** (`pairingCode()`), once the nonces were exchanged and the reveal matched the commitment */
@@ -303,6 +331,27 @@ export class FakeExtension {
       state: extension.state(),
     });
     extension.welcome = await welcome;
+    // Off loopback the daemon waits for this before anything else
+    if (
+      extension.welcome.authChallenge &&
+      extension.welcome.host &&
+      options.browserAuth !== false
+    ) {
+      const key = options.browserKey ?? createBrowserKey();
+      extension.browserKey = key;
+      extension.post({
+        type: "browserAuth",
+        key: key.key,
+        signature: key.sign(
+          browserAuthPayload(
+            extension.welcome.host,
+            options.port,
+            extension.welcome.authChallenge,
+          ),
+        ),
+        ...(options.joinToken ? { joinToken: options.joinToken } : {}),
+      });
+    }
     ws.on("message", (data) => void extension.onDaemonMessage(data.toString()));
     if (extension.pairing === "pending" && options.pairingNonce !== false) {
       await extension.exchangePairingNonces();

@@ -19,6 +19,8 @@ import { VERSION } from "@/version";
 export type ThinOptions = {
   capabilities: Capability[];
   port?: number;
+  /** `--host`: the address the daemon listens on, passed on when it starts one */
+  host?: string;
   home?: string;
   version?: string;
   /** Starts the daemon. Default: this package's `dist/daemon.js` with the current Node */
@@ -57,6 +59,7 @@ export function createThinServer(options: ThinOptions) {
   const daemon = new DaemonClient({
     home: options.home ?? browserMcpHome(),
     port: options.port,
+    host: options.host,
     version: options.version ?? VERSION,
     daemonCommand: options.daemonCommand ?? [
       process.execPath,

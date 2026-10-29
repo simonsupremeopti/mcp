@@ -12,12 +12,14 @@ import {
 
 import {
   NO_EXTENSION_MESSAGE,
+  RELAY_PROTOCOL_VERSION,
   RelayCloseCode,
   RelayUpdateReason,
   pairingRequiredMessage,
 } from "@browsermcp/protocol";
 
 import type { BackendEvents } from "@/contracts";
+import { verifyBrowserSignature } from "@/daemon/browsers";
 import type { CdpBridge } from "@/relay/bridge";
 import {
   noSuchTabMessage,
@@ -126,7 +128,7 @@ describe("RelayBackend", () => {
   it("signs the extension's challenge with its key (verified with WebCrypto)", async () => {
     const extension = await connect();
     expect(await extension.verifyWelcome()).toBe(true);
-    expect(extension.welcome.protocol).toBe(1);
+    expect(extension.welcome.protocol).toBe(RELAY_PROTOCOL_VERSION);
   });
 
   it("signs the port it listens on, so a challenge relayed from another port fails verification", async () => {
@@ -343,6 +345,66 @@ describe("RelayBackend", () => {
     relay = await startTestBackend({ unknownTabWaitMs: 100 });
     await connect();
     await expect(relay.backend.findTab(987_654)).resolves.toBeUndefined();
+  });
+
+  describe("off loopback", () => {
+    // The daemon only has to believe it listens off loopback; the socket stays on 127.0.0.1
+    const host = "10.1.2.3";
+
+    it("refuses a browser whose key it doesn't know, naming the join token", async () => {
+      await relay.close();
+      relay = await startTestBackend({
+        host,
+        authorizeBrowser: ({ key, joinToken }) =>
+          joinToken === "right" || key === "known"
+            ? null
+            : "Paste the join token into the extension's settings",
+      });
+      const extension = await connect();
+      expect(await extension.closed).toMatchObject({
+        code: RelayCloseCode.notAuthorized,
+      });
+      expect(relay.backend.connected).toBe(false);
+      await vi.waitUntil(
+        () =>
+          relay.backend.unavailableReason() ===
+          "Paste the join token into the extension's settings",
+      );
+    });
+
+    it("accepts a browser that sends the join token, and checks its signature", async () => {
+      const seen: { key: string; signature: string; challenge: string }[] = [];
+      await relay.close();
+      relay = await startTestBackend({
+        host,
+        authorizeBrowser: (auth) => {
+          seen.push(auth);
+          return verifyBrowserSignature(auth) && auth.joinToken === "right"
+            ? null
+            : "No";
+        },
+      });
+      const extension = await connect({ joinToken: "right" });
+      await vi.waitUntil(() => relay.backend.connected);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]?.key).toBe(extension.browserKey?.key);
+      // The daemon signed the host as well as the port, so the extension can tell the two apart
+      expect(extension.welcome.host).toBe(host);
+      expect(extension.welcome.authChallenge).toEqual(expect.any(String));
+    });
+
+    it("closes a browser that never proves its key", async () => {
+      await relay.close();
+      relay = await startTestBackend({
+        host,
+        authTimeoutMs: 100,
+        authorizeBrowser: () => null,
+      });
+      const extension = await connect({ browserAuth: false });
+      expect(await extension.closed).toMatchObject({
+        code: RelayCloseCode.notAuthorized,
+      });
+    });
   });
 
   it("times out requests the extension doesn't answer, forgetting them", async () => {

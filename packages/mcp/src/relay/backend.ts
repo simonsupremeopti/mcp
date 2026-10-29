@@ -17,6 +17,7 @@ import type {
 } from "@/contracts";
 import { BrowserSlot } from "@/relay/browser-slot";
 import {
+  BrowserNotAuthorizedError,
   ExtensionConnection,
   type ExtensionConnectionOptions,
   ExtensionProtocolError,
@@ -96,6 +97,8 @@ export class RelayBackend implements BrowserBackend {
   private nextSlotId = 1;
   /** Why the last extension couldn't connect, for `unavailableReason()` */
   private lastProblem: "update-extension" | "update-server" | null = null;
+  /** Why the last browser off loopback wasn't allowed (it needs the join token), until one connects */
+  private notAuthorized: string | null = null;
   /** The last extension `/extension` refused by Origin, until one connects: `unavailableReason()` names it, since the extension only retries */
   private rejectedExtension: { id: string | undefined; at: number } | null =
     null;
@@ -146,6 +149,8 @@ export class RelayBackend implements BrowserBackend {
     } catch (error) {
       if (error instanceof ExtensionProtocolError) {
         this.lastProblem = "update-extension";
+      } else if (error instanceof BrowserNotAuthorizedError) {
+        this.notAuthorized = error.message;
       }
       log("Extension handshake failed:", error);
       return;
@@ -200,6 +205,7 @@ export class RelayBackend implements BrowserBackend {
     }
     this.slots.set(id, slot);
     this.lastProblem = null;
+    this.notAuthorized = null;
     connection.onEvent((event) => {
       if (this.slots.get(id) !== slot) {
         return;
@@ -319,6 +325,9 @@ export class RelayBackend implements BrowserBackend {
         Date.now() - this.rejectedExtension.at < REJECTED_EXTENSION_MS
       ) {
         return rejectedExtensionMessage(this.rejectedExtension.id);
+      }
+      if (this.notAuthorized) {
+        return this.notAuthorized;
       }
       if (this.lastProblem === "update-extension") {
         return UPDATE_EXTENSION_MESSAGE;

@@ -180,7 +180,17 @@ function ConnectionAlert({
   if (connection.state === "updateServer" || legacyServer) {
     return <UpdateAlert kind="server" />;
   }
-  // Searching, another browser holds the connection, or the program on the port couldn't be verified
+  if (connection.state === "notAuthorized") {
+    return (
+      <div className="px-4 pb-3">
+        <Alert variant="destructive" title="This browser isn't allowed yet">
+          {connection.message ??
+            `The ${APP_NAME} server runs on another machine and doesn't know this browser. Paste its join token into Settings.`}
+        </Alert>
+      </div>
+    );
+  }
+  // Searching, or the program on the port couldn't be verified
   if (connection.state === "untrusted") {
     return (
       <div className="px-4 pb-3">

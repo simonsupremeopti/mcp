@@ -1,11 +1,18 @@
 import {
+  BROWSER_KEY_ALGORITHM,
+  type ExtensionMessage,
   PAIRING_KEY_ALGORITHM,
+  browserAuthPayload,
   pairingCode,
   pairingCommitment,
   pairingPayload,
 } from "@browsermcp/protocol";
 
-import { pairedDaemonKeysItem } from "../storage";
+import {
+  browserKeyItem,
+  joinTokenItem,
+  pairedDaemonKeysItem,
+} from "../storage";
 
 /** Base64 of 32 random bytes, which the daemon signs in `welcome` */
 export function createChallenge(): string {
@@ -18,12 +25,15 @@ export function createChallenge(): string {
 export async function verifyDaemonSignature({
   challenge,
   port,
+  host,
   publicKey,
   pairingCommitment,
   signature,
 }: {
   challenge: string;
   port: number;
+  /** The host the extension dialed, when the daemon isn't on loopback */
+  host?: string;
   publicKey: string;
   pairingCommitment: string;
   signature: string;
@@ -47,7 +57,7 @@ export async function verifyDaemonSignature({
       key,
       fromBase64(signature),
       new TextEncoder().encode(
-        pairingPayload(challenge, port, pairingCommitment),
+        pairingPayload(challenge, port, pairingCommitment, host),
       ),
     );
   } catch {
@@ -110,4 +120,66 @@ function fromBase64(base64: string): Uint8Array<ArrayBuffer> {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
+}
+
+/**
+ * This browser's own key pair, made on first use and kept in `storage.local`. A daemon off loopback only drives browsers whose public key is in its allowlist, which the join token adds to: without it anyone who can route to the daemon's port could connect as a browser and have the agent drive their tabs
+ */
+async function browserKey(): Promise<{
+  publicKey: string;
+  key: CryptoKey;
+}> {
+  const stored = await browserKeyItem.getValue();
+  if (stored) {
+    return {
+      publicKey: stored.publicKey,
+      key: await crypto.subtle.importKey(
+        "jwk",
+        stored.privateKey,
+        {
+          name: BROWSER_KEY_ALGORITHM.name,
+          namedCurve: BROWSER_KEY_ALGORITHM.namedCurve,
+        },
+        true,
+        ["sign"],
+      ),
+    };
+  }
+  const pair = await crypto.subtle.generateKey(
+    {
+      name: BROWSER_KEY_ALGORITHM.name,
+      namedCurve: BROWSER_KEY_ALGORITHM.namedCurve,
+    },
+    true,
+    ["sign", "verify"],
+  );
+  const publicKey = toBase64(
+    new Uint8Array(await crypto.subtle.exportKey("spki", pair.publicKey)),
+  );
+  await browserKeyItem.setValue({
+    publicKey,
+    privateKey: await crypto.subtle.exportKey("jwk", pair.privateKey),
+  });
+  return { publicKey, key: pair.privateKey };
+}
+
+/** The answer to `welcome`'s `authChallenge`: this browser's key and its signature of `browserAuthPayload(host, port, challenge)`, with the join token while the daemon doesn't know the key yet */
+export async function createBrowserAuth(
+  host: string,
+  port: number,
+  challenge: string,
+): Promise<Extract<ExtensionMessage, { type: "browserAuth" }>> {
+  const { publicKey, key } = await browserKey();
+  const signature = await crypto.subtle.sign(
+    { name: BROWSER_KEY_ALGORITHM.name, hash: BROWSER_KEY_ALGORITHM.hash },
+    key,
+    new TextEncoder().encode(browserAuthPayload(host, port, challenge)),
+  );
+  const joinToken = await joinTokenItem.getValue();
+  return {
+    type: "browserAuth",
+    key: publicKey,
+    signature: toBase64(new Uint8Array(signature)),
+    ...(joinToken ? { joinToken } : {}),
+  };
 }

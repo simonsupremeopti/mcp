@@ -17,7 +17,7 @@
 import type { Protocol } from "devtools-protocol/types/protocol";
 
 /** Bumped on breaking changes. Each side states the versions it supports, so later releases can stay compatible */
-export const RELAY_PROTOCOL_VERSION = 1;
+export const RELAY_PROTOCOL_VERSION = 2;
 
 /** The ports the daemon binds (the first free one) and the extension tries, in order. `--port` sets one port for both (the extension's settings, `isValidRelayPort()`) */
 export const RELAY_PORTS = [9010, 9011, 9012] as const;
@@ -57,9 +57,27 @@ export function pairingPayload(
   challenge: string,
   port: number,
   pairingCommitment: string,
+  /** The host the extension dialed, for a daemon that isn't on loopback. Omitted on loopback, so protocol 1 extensions still verify */
+  host?: string,
 ): string {
-  return `${RELAY_PRODUCT}-pair-v1:${port}:${challenge}:${pairingCommitment}`;
+  return host === undefined
+    ? `${RELAY_PRODUCT}-pair-v1:${port}:${challenge}:${pairingCommitment}`
+    : `${RELAY_PRODUCT}-pair-v2:${host}:${port}:${challenge}:${pairingCommitment}`;
 }
+
+/**
+ * The bytes the extension signs with its own key in `browserAuth`, so a daemon off loopback only drives browsers the user allowed. It names the host and port the extension dialed and the daemon's `authChallenge`, so a signature can't be replayed to another daemon or reused on another connection
+ */
+export function browserAuthPayload(
+  host: string,
+  port: number,
+  authChallenge: string,
+): string {
+  return `${RELAY_PRODUCT}-browser-v1:${host}:${port}:${authChallenge}`;
+}
+
+/** A browser's key pair (`PAIRING_KEY_ALGORITHM`), made on first run and kept in the extension's storage. Its public key is what the daemon's allowlist holds */
+export const BROWSER_KEY_ALGORITHM = PAIRING_KEY_ALGORITHM;
 
 /** A pairing nonce: base64 of 32 random bytes, fresh for each connection */
 export function createPairingNonce(): string {
@@ -161,6 +179,8 @@ export const RelayCloseCode = {
   anotherBrowser: 4002,
   /** The daemon is exiting (idle, or replaced by a newer one). The extension reconnects */
   shuttingDown: 4003,
+  /** The daemon isn't on loopback and doesn't know this browser's key. The reason is a message for the user: paste the daemon's join token into the extension's settings */
+  notAuthorized: 4004,
 } as const;
 
 /** The reasons sent with `RelayCloseCode.unsupportedProtocol` */
@@ -179,6 +199,8 @@ export type RelayCapability =
   | "tabOpened"
   /** The extension manages tab groups per AI app */
   | "tabGroups"
+  /** The extension proves its own key in `browserAuth`, so a daemon off loopback can allow browsers one by one */
+  | "browserAuth"
   | (string & {});
 
 // --- State the extension reports ---
@@ -314,6 +336,17 @@ export type ExtensionMessage =
     }
   /** After `welcome`, only for a key the extension hasn't paired with: its nonce for `pairingCode()` (`createPairingNonce()`), sent before the daemon reveals its own. Once per connection */
   | { type: "pairingNonce"; nonce: string }
+  /**
+   * The answer to `welcome`'s `authChallenge`, proving the browser's own key to a daemon that isn't on loopback. `joinToken` is sent only when the user pasted one into the extension's settings; the daemon adds the key to its allowlist when it matches, so the token is needed once per browser
+   */
+  | {
+      type: "browserAuth";
+      /** Base64 SPKI of the browser's public key */
+      key: string;
+      /** Base64 IEEE P1363 of `browserAuthPayload(host, port, authChallenge)` */
+      signature: string;
+      joinToken?: string;
+    }
   | {
       type: "response";
       id: number;
@@ -335,8 +368,12 @@ export type DaemonMessage =
       publicKey: string;
       /** Base64 SHA-256 of the daemon's nonce for this connection (`pairingCommitment()`), revealed in `pairingReveal` */
       pairingCommitment: string;
-      /** Its signature of `pairingPayload(challenge, port, pairingCommitment)` (base64 IEEE P1363), with the port it listens on */
+      /** Its signature of `pairingPayload(challenge, port, pairingCommitment, host)` (base64 IEEE P1363), with the port it listens on and, off loopback, the host */
       signature: string;
+      /** Base64 of 32 random bytes the extension signs in `browserAuth`. Only from a daemon that isn't on loopback */
+      authChallenge?: string;
+      /** The host the daemon listens on, when that isn't loopback: the extension checks it against the host it dialed */
+      host?: string;
     }
   /** The answer to `pairingNonce`: the nonce behind `welcome`'s `pairingCommitment` */
   | { type: "pairingReveal"; nonce: string }

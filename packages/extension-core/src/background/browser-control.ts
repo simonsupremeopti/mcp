@@ -20,6 +20,8 @@ import {
   legacyPortItem,
   legacyServerItem,
   pausedItem,
+  joinTokenItem,
+  relayHostItem,
   relayPortItem,
 } from "../storage";
 import type {
@@ -37,7 +39,12 @@ import {
   isExposedTab,
   isExposedUrl,
 } from "./exposure";
-import { addPairedKey, isPairedKey, verifyDaemonSignature } from "./pairing";
+import {
+  addPairedKey,
+  createBrowserAuth,
+  isPairedKey,
+  verifyDaemonSignature,
+} from "./pairing";
 import {
   forgetGroup,
   forgetTab,
@@ -121,9 +128,13 @@ export class BrowserControl {
     );
     this.connection = new RelayConnection({
       ...connectionOptions,
-      getPorts: async () => {
-        const port = await relayPortItem.getValue();
-        return port ? [port] : RELAY_PORTS;
+      getEndpoints: async () => {
+        const [host, port] = await Promise.all([
+          relayHostItem.getValue(),
+          relayPortItem.getValue(),
+        ]);
+        const ports = port ? [port] : RELAY_PORTS;
+        return ports.map((each) => ({ host: host ?? "127.0.0.1", port: each }));
       },
       getLegacyPort: async () =>
         (legacyPortOverride && (await legacyPortItem.getValue())) ||
@@ -142,16 +153,20 @@ export class BrowserControl {
           pairing: "pending",
         },
       }),
-      verifyWelcome: (welcome, challenge, port) =>
+      verifyWelcome: (welcome, challenge, endpoint) =>
         verifyDaemonSignature({
           challenge,
-          port,
+          port: endpoint.port,
+          host: welcome.host,
           publicKey: welcome.publicKey,
           pairingCommitment: welcome.pairingCommitment,
           signature: welcome.signature,
         }),
+      createBrowserAuth: (endpoint, challenge) =>
+        createBrowserAuth(endpoint.host, endpoint.port, challenge),
       isPaired: (publicKey) => isPairedKey(publicKey),
-      onWelcome: (welcome, port, code) => this.#onWelcome(welcome, port, code),
+      onWelcome: (welcome, endpoint, code) =>
+        this.#onWelcome(welcome, endpoint.port, code),
       onRequest: (request) => this.#handleRequest(request),
       setStatus: (status) => this.#setStatus(status),
       setLegacyServer: (present) => this.#setLegacyServer(present),
@@ -647,6 +662,18 @@ export class BrowserControl {
     await this.#sendState();
   }
 
+  /** Sets the host the daemon runs on (`--host`), or `null` for this machine, and looks again */
+  async setRelayHost(host: string | null): Promise<void> {
+    await relayHostItem.setValue(host?.trim() || null);
+    this.connection.reconnect();
+  }
+
+  /** Sets the join token for a daemon off loopback, which needs it once per browser */
+  async setJoinToken(token: string | null): Promise<void> {
+    await joinTokenItem.setValue(token?.trim() || null);
+    this.connection.reconnect();
+  }
+
   /** Sets the port to look for the daemon on (the one given to its `--port`), or `null` for `RELAY_PORTS`, and looks again */
   async setRelayPort(port: number | null): Promise<void> {
     if (port !== null && !isValidRelayPort(port)) {
@@ -662,14 +689,23 @@ export class BrowserControl {
 
   /** What the popup shows */
   async getView(): Promise<BrowserControlView> {
-    const [connection, legacyServer, paused, groups, relayPort] =
-      await Promise.all([
-        connectionStatusItem.getValue(),
-        legacyServerItem.getValue(),
-        pausedItem.getValue(),
-        appGroupsItem.getValue(),
-        relayPortItem.getValue(),
-      ]);
+    const [
+      connection,
+      legacyServer,
+      paused,
+      groups,
+      relayPort,
+      relayHost,
+      joinToken,
+    ] = await Promise.all([
+      connectionStatusItem.getValue(),
+      legacyServerItem.getValue(),
+      pausedItem.getValue(),
+      appGroupsItem.getValue(),
+      relayPortItem.getValue(),
+      relayHostItem.getValue(),
+      joinTokenItem.getValue(),
+    ]);
     const tabs = await browser.tabs.query({});
     const tabsById = new Map(tabs.map((tab) => [tab.id, tab]));
 
@@ -701,6 +737,8 @@ export class BrowserControl {
       legacyServer,
       paused,
       relayPort,
+      relayHost,
+      hasJoinToken: !!joinToken,
       apps,
     };
   }

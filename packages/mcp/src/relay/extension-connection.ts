@@ -20,12 +20,16 @@ import {
 } from "@browsermcp/protocol";
 
 import { RELAY_MIN_PROTOCOL_VERSION } from "@/relay/constants";
+import { isLoopbackHost } from "@/relay/hosts";
 import type { Logger } from "@/utils/log";
 
 export type ExtensionHello = Extract<ExtensionMessage, { type: "hello" }>;
 
 /** What the daemon announces in `welcome` */
 const DAEMON_CAPABILITIES: RelayCapability[] = [];
+
+/** Rejected by `ExtensionConnection.accept()` when a browser off loopback isn't allowed; the socket was closed with `RelayCloseCode.notAuthorized` */
+export class BrowserNotAuthorizedError extends Error {}
 
 /** Rejected by `ExtensionConnection.accept()` when the extension's protocol is too old; the socket was closed with `RelayCloseCode.unsupportedProtocol` */
 export class ExtensionProtocolError extends Error {
@@ -47,6 +51,20 @@ export type ExtensionConnectionOptions = {
   identity: PairingKey;
   /** The port the extension dialed, signed with its challenge (`pairingPayload()`) */
   port: number;
+  /** The host the daemon listens on. Off loopback the browser must prove its own key before the connection is usable */
+  host?: string;
+  /** Off loopback: whether this browser may connect. Returns null when it may, or a message for the user */
+  authorizeBrowser?(auth: {
+    key: string;
+    signature: string;
+    joinToken?: string;
+    challenge: string;
+    host: string;
+    port: number;
+    browser: ExtensionHello["browser"];
+  }): string | null;
+  /** How long the browser has to answer `authChallenge` (10 s) */
+  authTimeoutMs?: number;
   log: Logger;
   helloTimeoutMs?: number;
   pingIntervalMs?: number;
@@ -150,6 +168,9 @@ export class ExtensionConnection {
         const pairingCommitment = createHash("sha256")
           .update(Buffer.from(daemonNonce, "base64"))
           .digest("base64");
+        // Off loopback the browser proves its own key, so only browsers the user allowed are driven
+        const host = isLoopbackHost(options.host) ? undefined : options.host;
+        const authChallenge = host ? createPairingNonce() : undefined;
         const welcome: DaemonMessage = {
           type: "welcome",
           protocol: RELAY_PROTOCOL_VERSION,
@@ -158,11 +179,61 @@ export class ExtensionConnection {
           publicKey: options.identity.publicKey,
           pairingCommitment,
           signature: options.identity.sign(
-            pairingPayload(message.challenge, options.port, pairingCommitment),
+            pairingPayload(
+              message.challenge,
+              options.port,
+              pairingCommitment,
+              host,
+            ),
           ),
+          ...(host ? { authChallenge, host } : {}),
         };
         ws.send(JSON.stringify(welcome));
-        resolve(new ExtensionConnection(ws, message, options, daemonNonce));
+        const hello = message;
+        if (!host || !authChallenge) {
+          resolve(new ExtensionConnection(ws, hello, options, daemonNonce));
+          return;
+        }
+        const refuse = (reason: string) => {
+          ws.close(RelayCloseCode.notAuthorized, reason);
+          reject(new BrowserNotAuthorizedError(reason));
+        };
+        const authTimer = setTimeout(
+          () => refuse("The browser didn't prove its key"),
+          options.authTimeoutMs ?? 10_000,
+        );
+        // `browserAuth` comes before any other frame the extension sends after `welcome`
+        ws.once("message", (authData) => {
+          clearTimeout(authTimer);
+          let auth: ExtensionMessage | undefined;
+          try {
+            auth = JSON.parse(authData.toString());
+          } catch {
+            auth = undefined;
+          }
+          if (
+            auth?.type !== "browserAuth" ||
+            typeof auth.key !== "string" ||
+            typeof auth.signature !== "string"
+          ) {
+            refuse("The browser didn't prove its key");
+            return;
+          }
+          const problem = options.authorizeBrowser?.({
+            key: auth.key,
+            signature: auth.signature,
+            joinToken: auth.joinToken,
+            challenge: authChallenge,
+            host,
+            port: options.port,
+            browser: hello.browser,
+          });
+          if (problem) {
+            refuse(problem);
+            return;
+          }
+          resolve(new ExtensionConnection(ws, hello, options, daemonNonce));
+        });
       });
     });
   }

@@ -13,7 +13,7 @@ import {
   type DaemonToClientMethods,
   type DaemonWelcome,
 } from "@/contracts";
-import { fetchStatus, readDaemonInfo } from "@/daemon/info";
+import { fetchStatus, hostForUrl, readDaemonInfo } from "@/daemon/info";
 import { daemonInfoPath, daemonStartingPath } from "@/daemon/paths";
 import { RELAY_HOST } from "@/relay/constants";
 import { extensionIdsFromEnv } from "@/relay/extension-ids";
@@ -25,6 +25,8 @@ export type DaemonClientOptions = {
   home: string;
   /** `--port`: the daemon on this port only */
   port?: number;
+  /** `--host`: passed to a daemon this process starts, so it listens off loopback */
+  host?: string;
   /** This thin process's version: an older daemon is replaced */
   version: string;
   /** Starts the daemon: `[node, <package>/dist/daemon.js]`; `--port` is appended */
@@ -126,7 +128,7 @@ export class DaemonClient {
     if (!info) {
       return null;
     }
-    const status = await fetchStatus(info.port);
+    const status = await fetchStatus(info.port, undefined, info.host);
     return status && status.pid === info.pid ? { info, status } : null;
   }
 
@@ -161,6 +163,9 @@ export class DaemonClient {
     if (this.options.port) {
       args.push("--port", String(this.options.port));
     }
+    if (this.options.host) {
+      args.push("--host", this.options.host);
+    }
     this.options.log("Starting the Browser MCP daemon");
     this.markStarting();
     const child = spawn(command!, args, {
@@ -189,14 +194,14 @@ export class DaemonClient {
   /** Asks an older daemon to exit once no calls are in flight, and waits until it's gone */
   private async replace(info: DaemonInfo) {
     await fetch(
-      `http://${RELAY_HOST}:${info.port}${RelayPaths.shutdown}?token=${encodeURIComponent(info.token)}`,
+      `http://${hostForUrl(info.host ?? RELAY_HOST)}:${info.port}${RelayPaths.shutdown}?token=${encodeURIComponent(info.token)}`,
       { method: "POST", signal: AbortSignal.timeout(70_000) },
     ).catch(() => {});
     // Older thin processes would otherwise start the old version again as soon as it's gone
     this.markStarting();
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
-      const status = await fetchStatus(info.port, 300);
+      const status = await fetchStatus(info.port, 300, info.host);
       if (!status || status.pid !== info.pid) {
         return;
       }
@@ -245,7 +250,7 @@ export class DaemonClient {
 
   private open(info: DaemonInfo): Promise<Peer> {
     const ws = new WebSocket(
-      `ws://${RELAY_HOST}:${info.port}${RelayPaths.client}?token=${encodeURIComponent(info.token)}`,
+      `ws://${hostForUrl(info.host ?? RELAY_HOST)}:${info.port}${RelayPaths.client}?token=${encodeURIComponent(info.token)}`,
       { perMessageDeflate: false, maxPayload: 256 * 1024 * 1024 },
     );
     return new Promise((resolve, reject) => {

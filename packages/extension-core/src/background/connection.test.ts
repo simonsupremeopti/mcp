@@ -27,7 +27,8 @@ function setup(
   const statuses: ConnectionStatus[] = [];
   const legacy: boolean[] = [];
   const options: RelayConnectionOptions = {
-    getPorts: async () => RELAY_PORTS,
+    getEndpoints: async () =>
+      RELAY_PORTS.map((port) => ({ host: "127.0.0.1", port })),
     createHello: async (challenge) => ({
       type: "hello",
       protocol: RELAY_PROTOCOL_VERSION,
@@ -37,10 +38,10 @@ function setup(
       challenge,
       state: { tabs: [], paused: false, pairing: "pending" },
     }),
-    verifyWelcome: (message, challenge, port) =>
+    verifyWelcome: (message, challenge, endpoint) =>
       verifyDaemonSignature({
         challenge,
-        port,
+        port: endpoint.port,
         publicKey: message.publicKey,
         pairingCommitment: message.pairingCommitment,
         signature: message.signature,
@@ -119,7 +120,10 @@ describe("the connection to the daemon", () => {
     );
 
     FakeWebSocket.reset();
-    const custom = setup({ 9123: "daemon" }, { getPorts: async () => [9123] });
+    const custom = setup(
+      { 9123: "daemon" },
+      { getEndpoints: async () => [{ host: "127.0.0.1", port: 9123 }] },
+    );
     custom.connection.ensureRunning();
     await vi.advanceTimersByTimeAsync(0);
     expect(probedPorts(custom.fetch)).toEqual([9123]);
@@ -217,7 +221,11 @@ describe("the connection to the daemon", () => {
     expect(atob(sent!.nonce)).toHaveLength(32);
     const code = await daemon.code();
     expect(code).toMatch(/^\d{3} \d{3}$/);
-    expect(options.onWelcome).toHaveBeenCalledWith(daemon.message, 9010, code);
+    expect(options.onWelcome).toHaveBeenCalledWith(
+      daemon.message,
+      { host: "127.0.0.1", port: 9010 },
+      code,
+    );
     // The extension's nonce follows `hello` and comes before anything else
     expect(
       ws.sent.map((message) => (message as { type: string }).type),
@@ -229,7 +237,11 @@ describe("the connection to the daemon", () => {
       isPaired: vi.fn(async () => true),
     });
     await vi.waitFor(() => expect(options.onWelcome).toHaveBeenCalled());
-    expect(options.onWelcome).toHaveBeenCalledWith(daemon.message, 9010, null);
+    expect(options.onWelcome).toHaveBeenCalledWith(
+      daemon.message,
+      { host: "127.0.0.1", port: 9010 },
+      null,
+    );
     expect(ws.messages("pairingNonce")).toEqual([]);
   });
 

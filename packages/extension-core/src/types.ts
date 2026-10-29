@@ -62,7 +62,9 @@ export type ConnectionStatus =
   /** The daemon's protocol is older than the extension's */
   | { state: "updateServer"; daemonVersion?: string }
   /** The daemon's protocol is newer than the extension's */
-  | { state: "updateExtension"; daemonVersion?: string };
+  | { state: "updateExtension"; daemonVersion?: string }
+  /** The daemon isn't on loopback and doesn't know this browser's key: its join token goes in the extension's settings */
+  | { state: "notAuthorized"; message?: string };
 
 /** An AI app using the browser, with its tabs, for the popup */
 export type BrowserControlApp = {
@@ -80,5 +82,9 @@ export type BrowserControlView = {
   paused: boolean;
   /** The custom port to look for the daemon on, or `null` for the default ports */
   relayPort: number | null;
+  /** The host the daemon runs on, or `null` for this machine */
+  relayHost: string | null;
+  /** Whether a join token is saved (the token itself stays in storage) */
+  hasJoinToken: boolean;
   apps: BrowserControlApp[];
 };

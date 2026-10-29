@@ -36,6 +36,16 @@ export function identityPath(home: string): string {
   return path.join(home, "identity.json");
 }
 
+/** `browsers.json`: the browsers allowed to connect to a daemon that isn't on loopback */
+export function browsersPath(home: string): string {
+  return path.join(home, "browsers.json");
+}
+
+/** `join-token` (0600): pasted into a new browser's settings once, to let it join a daemon that isn't on loopback */
+export function joinTokenPath(home: string): string {
+  return path.join(home, "join-token");
+}
+
 /** `dev-extension-ids`: extension IDs of dev builds, one per line, which the daemon allows on `/extension` as they connect (a build tool can append its ID here instead of the AI app's MCP config being edited) */
 export function devExtensionIdsPath(home: string): string {
   return path.join(home, "dev-extension-ids");

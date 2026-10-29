@@ -38,10 +38,11 @@ export function removeDaemonInfo(file: string, pid = process.pid) {
 export async function fetchStatus(
   port: number,
   timeoutMs = 1000,
+  host: string = RELAY_HOST,
 ): Promise<RelayStatus | null> {
   try {
     const response = await fetch(
-      `http://${RELAY_HOST}:${port}${RelayPaths.status}`,
+      `http://${hostForUrl(host)}:${port}${RelayPaths.status}`,
       { signal: AbortSignal.timeout(timeoutMs) },
     );
     if (!response.ok) {
@@ -52,4 +53,9 @@ export async function fetchStatus(
   } catch {
     return null;
   }
+}
+
+/** An IPv6 address needs brackets in a URL */
+export function hostForUrl(host: string): string {
+  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }

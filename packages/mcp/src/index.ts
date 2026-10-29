@@ -18,7 +18,11 @@ program
     "--port <port>",
     "use the daemon on this port only (set the same port in the extension)",
   )
-  .action(async (options: { caps?: string; port?: string }) => {
+  .option(
+    "--host <host>",
+    "run the daemon on this address instead of 127.0.0.1, so browsers on other machines can reach it (a private network only)",
+  )
+  .action(async (options: { caps?: string; port?: string; host?: string }) => {
     const requested = (options.caps ?? "")
       .split(",")
       .map((cap) => cap.trim())
@@ -37,7 +41,11 @@ program
       console.error(`Invalid port: ${options.port}`);
       process.exit(1);
     }
-    await runThin({ capabilities: requested as Capability[], port });
+    await runThin({
+      capabilities: requested as Capability[],
+      port,
+      host: options.host,
+    });
   });
 
 program.parse(process.argv);

@@ -14,9 +14,11 @@ import {
   type DaemonWelcome,
 } from "@/contracts";
 import { appFromClient } from "@/daemon/app-info";
+import { BrowserAllowlist, verifyBrowserSignature } from "@/daemon/browsers";
 import { loadIdentity } from "@/daemon/identity";
 import {
   fetchStatus,
+  hostForUrl,
   readDaemonInfo,
   removeDaemonInfo,
   writeDaemonInfo,
@@ -25,6 +27,7 @@ import {
   daemonInfoPath,
   devExtensionIdsPath,
   ensureHome,
+  joinTokenPath,
 } from "@/daemon/paths";
 import { RelayBackend } from "@/relay/backend";
 import { RELAY_HOST } from "@/relay/constants";
@@ -33,6 +36,11 @@ import {
   extensionIdsFromEnv,
   readDevExtensionIds,
 } from "@/relay/extension-ids";
+import {
+  isLoopbackHost,
+  isPrivateHost,
+  publicHostMessage,
+} from "@/relay/hosts";
 import { RelayServer } from "@/relay/server";
 import type { Logger } from "@/utils/log";
 import {
@@ -47,6 +55,8 @@ export type DaemonOptions = {
   home: string;
   /** `--port`: only this port */
   port?: number;
+  /** `--host`: the address to bind, `127.0.0.1` by default. Off loopback, browsers must prove a key the user allowed with the join token */
+  host?: string;
   /** The ports to try in order when there's no `port` (`RELAY_PORTS`; tests pass their own) */
   ports?: readonly number[];
   version: string;
@@ -102,11 +112,38 @@ export async function startDaemon(options: DaemonOptions): Promise<Daemon> {
       return true;
     },
   };
+  const host = options.host ?? RELAY_HOST;
+  if (!isPrivateHost(host)) {
+    throw new Error(publicHostMessage(host));
+  }
+  const allowlist = isLoopbackHost(host)
+    ? null
+    : BrowserAllowlist.load(home, log);
+  if (allowlist) {
+    log(
+      `Listening off loopback on ${host}. A browser joins with the token in ${joinTokenPath(home)}`,
+    );
+  }
   const backend = new RelayBackend({
     daemonVersion: options.version,
     identity,
     log,
     hasSessions: () => sessions.size > 0,
+    host,
+    authorizeBrowser: (auth) => {
+      if (!allowlist) {
+        return null;
+      }
+      if (!verifyBrowserSignature(auth)) {
+        return "The browser's key didn't check out";
+      }
+      if (allowlist.has(auth.key)) {
+        return null;
+      }
+      return allowlist.join(auth.key, auth.joinToken, auth.browser)
+        ? null
+        : `This browser isn't allowed yet. Paste the join token from ${joinTokenPath(home)} into the extension's settings`;
+    },
   });
   const engine = options.createEngine({ backend, log });
   let idleTimer: NodeJS.Timeout | undefined;
@@ -222,6 +259,7 @@ export async function startDaemon(options: DaemonOptions): Promise<Daemon> {
   const infoFile = daemonInfoPath(home, options.port);
   const relay = await listenOnFirstFreePort(options, infoFile, {
     token,
+    host,
     version: options.version,
     extensionIds: allowedExtensions,
     log,
@@ -239,11 +277,13 @@ export async function startDaemon(options: DaemonOptions): Promise<Daemon> {
     },
   });
   const port = relay.port;
+  // Playwright connects from this machine, so always over loopback, whatever the relay binds
   backend.setCdpUrl(
-    `ws://${RELAY_HOST}:${port}${RelayPaths.cdp}?token=${encodeURIComponent(token)}`,
+    `ws://${hostForUrl(host)}:${port}${RelayPaths.cdp}?token=${encodeURIComponent(token)}`,
   );
   writeDaemonInfo(infoFile, {
     port,
+    ...(isLoopbackHost(host) ? {} : { host }),
     pid: process.pid,
     version: options.version,
     token,
@@ -278,10 +318,10 @@ async function listenOnFirstFreePort(
 ): Promise<RelayServer> {
   const ports = options.port ? [options.port] : (options.ports ?? RELAY_PORTS);
   for (const port of ports) {
-    if (await isOurDaemon(port, infoFile)) {
+    if (await isOurDaemon(port, infoFile, options.host)) {
       throw new DaemonAlreadyRunningError(port);
     }
-    if (await isPortAnswering(port)) {
+    if (await isPortAnswering(port, options.host)) {
       options.log(`Port ${port} is held by another program; skipping it`);
       continue;
     }
@@ -292,7 +332,7 @@ async function listenOnFirstFreePort(
         throw error;
       }
       // Lost a race to another daemon starting at the same moment (which writes daemon.json before it answers anything), or another program
-      if (await isOurDaemon(port, infoFile)) {
+      if (await isOurDaemon(port, infoFile, options.host)) {
         throw new DaemonAlreadyRunningError(port);
       }
       options.log(`Port ${port} is held by another program; skipping it`);
@@ -306,8 +346,12 @@ async function listenOnFirstFreePort(
 /**
  * Whether one of our daemons serves the port: our `daemon.json` (for this port setting) names the port and the pid that `/browsermcp/status` reports, and the token in it opens `/client`. Any program can answer `/status` as `browsermcp`; one that isn't ours is skipped like any other program on the port
  */
-async function isOurDaemon(port: number, infoFile: string): Promise<boolean> {
-  const status = await fetchStatus(port, 500);
+async function isOurDaemon(
+  port: number,
+  infoFile: string,
+  host?: string,
+): Promise<boolean> {
+  const status = await fetchStatus(port, 500, host);
   if (!status) {
     return false;
   }
@@ -339,9 +383,9 @@ function opensClient(port: number, token: string): Promise<boolean> {
 }
 
 /** Whether something accepts connections on the port. Binding alone isn't enough: on macOS a socket on 0.0.0.0 doesn't stop us binding 127.0.0.1 */
-function isPortAnswering(port: number): Promise<boolean> {
+function isPortAnswering(port: number, host = RELAY_HOST): Promise<boolean> {
   return new Promise((resolve) => {
-    const socket = net.connect({ port, host: RELAY_HOST });
+    const socket = net.connect({ port, host });
     const done = (answering: boolean) => {
       socket.destroy();
       resolve(answering);

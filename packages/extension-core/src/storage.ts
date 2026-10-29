@@ -61,6 +61,24 @@ export const relayPortItem = storage.defineItem<number | null>(
   { fallback: null },
 );
 
+/** The host the daemon runs on, when that isn't this machine (`--host`). With it set, only that host is tried */
+export const relayHostItem = storage.defineItem<string | null>(
+  "local:relayHost",
+  { fallback: null },
+);
+
+/** The join token of a daemon off loopback, pasted in once: the daemon adds this browser's key to its allowlist and the token isn't needed again */
+export const joinTokenItem = storage.defineItem<string | null>(
+  "local:joinToken",
+  { fallback: null },
+);
+
+/** This browser's own key pair (JWK, `BROWSER_KEY_ALGORITHM`), made on first use: a daemon off loopback only drives browsers whose key the user allowed */
+export const browserKeyItem = storage.defineItem<{
+  publicKey: string;
+  privateKey: JsonWebKey;
+} | null>("local:browserKey", { fallback: null });
+
 /** Development and test builds only: the port to look for a 0.1.x server on instead of `LEGACY_PORT`, so the smoke test can run a fake one on a random port without touching 9009 */
 export const legacyPortItem = storage.defineItem<number | null>(
   "local:legacyPort",

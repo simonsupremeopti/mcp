@@ -19,9 +19,17 @@ export async function runDaemon(options: {
     .option("--port <port>", "listen on this port only", (value) =>
       Number.parseInt(value, 10),
     )
+    .option(
+      "--host <host>",
+      "listen on this address instead of 127.0.0.1 (a private network only)",
+    )
     .option("--stderr", "also log to stderr")
     .parse(options.argv);
-  const { port, stderr } = command.opts<{ port?: number; stderr?: boolean }>();
+  const { port, host, stderr } = command.opts<{
+    port?: number;
+    host?: string;
+    stderr?: boolean;
+  }>();
 
   const home = browserMcpHome();
   ensureHome(home);
@@ -35,6 +43,7 @@ export async function runDaemon(options: {
     const daemon = await startDaemon({
       home,
       port,
+      host,
       version: options.version,
       createEngine: options.createEngine,
       idleExitMs: options.idleExitMs,
