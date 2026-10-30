@@ -7,6 +7,7 @@ import {
 
 import { CdpBridge } from "@/relay/bridge";
 import type { ExtensionConnection } from "@/relay/extension-connection";
+import { TAB_DETACHED_MESSAGE } from "@/relay/messages";
 import type { Logger } from "@/utils/log";
 
 export type BrowserSlotOptions = {
@@ -86,10 +87,17 @@ export class BrowserSlot {
     }
   }
 
-  /** The Page of a claimed tab's target, connecting Playwright to this browser's bridge if it isn't yet */
-  async pageForTarget(targetId: string): Promise<Page> {
+  /**
+   * The Page of a claimed tab's target, connecting Playwright to this browser's bridge if it isn't yet.
+   *
+   * `stillClaimed` says whether the bridge still has the target. A page whose debugger detaches while Playwright is opening it (another extension's frame that comes back, say) leaves a Page that's already disposed, so the target ID is never read and no Page ever arrives: without this the wait would time out on every command from then on
+   */
+  async pageForTarget(
+    targetId: string,
+    stillClaimed: () => boolean = () => true,
+  ): Promise<Page> {
     await this.browser();
-    return await this.waitForPage(targetId);
+    return await this.waitForPage(targetId, stillClaimed);
   }
 
   /** Disconnects Playwright from this browser. The extension connection is closed by the backend */
@@ -143,10 +151,7 @@ export class BrowserSlot {
   private async identify(page: Page) {
     let targetId: string;
     try {
-      const session = await page.context().newCDPSession(page);
-      const { targetInfo } = await session.send("Target.getTargetInfo");
-      targetId = targetInfo.targetId;
-      await session.detach().catch(() => {});
+      targetId = await this.targetIdOf(page);
     } catch (error) {
       if (!page.isClosed()) {
         this.options.log("Couldn't identify a page:", error);
@@ -168,7 +173,21 @@ export class BrowserSlot {
     this.pageWaiters.delete(targetId);
   }
 
-  private waitForPage(targetId: string): Promise<Page> {
+  /** A new Page's target ID, read through a short-lived CDP session (the bridge answers `Target.getTargetInfo`) */
+  private async targetIdOf(page: Page): Promise<string> {
+    const session = await page.context().newCDPSession(page);
+    try {
+      const { targetInfo } = await session.send("Target.getTargetInfo");
+      return targetInfo.targetId;
+    } finally {
+      await session.detach().catch(() => {});
+    }
+  }
+
+  private waitForPage(
+    targetId: string,
+    stillClaimed: () => boolean,
+  ): Promise<Page> {
     const page = this.pages.get(targetId);
     if (page && !page.isClosed()) {
       return Promise.resolve(page);
@@ -176,17 +195,29 @@ export class BrowserSlot {
     return new Promise((resolve, reject) => {
       const waiters = this.pageWaiters.get(targetId) ?? new Set();
       this.pageWaiters.set(targetId, waiters);
-      const waiter = (page: Page) => {
+      const done = () => {
         clearTimeout(timeout);
-        resolve(page);
-      };
-      const timeout = setTimeout(() => {
+        clearInterval(dropped);
         waiters.delete(waiter);
         if (waiters.size === 0 && this.pageWaiters.get(targetId) === waiters) {
           this.pageWaiters.delete(targetId);
         }
+      };
+      const waiter = (page: Page) => {
+        done();
+        resolve(page);
+      };
+      const timeout = setTimeout(() => {
+        done();
         reject(new Error("The tab didn't become ready in time"));
       }, this.options.pageTimeoutMs ?? 15_000);
+      // The debugger detached again before Playwright finished opening the page: waiting the whole timeout would only repeat on the next command
+      const dropped = setInterval(() => {
+        if (!stillClaimed()) {
+          done();
+          reject(new Error(TAB_DETACHED_MESSAGE));
+        }
+      }, 100);
       waiters.add(waiter);
     });
   }

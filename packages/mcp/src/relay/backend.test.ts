@@ -23,6 +23,7 @@ import { verifyBrowserSignature } from "@/daemon/browsers";
 import type { CdpBridge } from "@/relay/bridge";
 import {
   noSuchTabMessage,
+  TAB_DETACHED_MESSAGE,
   rejectedExtensionMessage,
   UPDATE_EXTENSION_MESSAGE,
 } from "@/relay/messages";
@@ -72,7 +73,7 @@ function tabIdIn(browserId: string, extensionTabId: number) {
 type BrowserSlotInternals = {
   bridge: CdpBridge;
   connection: { pendingCount: number };
-  waitForPage(targetId: string): Promise<unknown>;
+  waitForPage(targetId: string, stillClaimed: () => boolean): Promise<unknown>;
   pageWaiters: Map<string, unknown>;
 };
 
@@ -425,10 +426,23 @@ describe("RelayBackend", () => {
     relay = await startTestBackend({ pageTimeoutMs: 100 });
     await connect();
     const browser = slot();
-    await expect(browser.waitForPage("missing")).rejects.toThrow(
+    await expect(browser.waitForPage("missing", () => true)).rejects.toThrow(
       "didn't become ready",
     );
     expect(browser.pageWaiters.size).toBe(0);
+  });
+
+  it("stops waiting for a page once the browser dropped its target", async () => {
+    await relay.close();
+    // Long enough that only giving up on the dropped target can end the wait
+    relay = await startTestBackend({ pageTimeoutMs: 30_000 });
+    await connect();
+    const started = Date.now();
+    // A tab whose debugger detaches again while Playwright opens it (another extension's frame that comes back) would otherwise hang every later command
+    await expect(slot().waitForPage("dropped", () => false)).rejects.toThrow(
+      TAB_DETACHED_MESSAGE,
+    );
+    expect(Date.now() - started).toBeLessThan(5000);
   });
 
   it("waits for an extension that's expected back, then answers at once", async () => {

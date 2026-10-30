@@ -14,9 +14,11 @@ import { chromium, type Page, type Worker } from "@playwright/test";
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -309,10 +311,13 @@ requests --filter api`,
 
   await section("a click at 125% zoom", async () => {
     await call(alpha, `goto ${fixtures.url("/zoom")}`);
-    await inWorker(async (tabId) => {
-      const { chrome } = globalThis as unknown as { chrome: Chrome };
-      await chrome.tabs.setZoom(tabId, 1.25);
-    }, await chromeTabIdOf(alpha, alphaTab));
+    await inWorker(
+      async (tabId) => {
+        const { chrome } = globalThis as unknown as { chrome: Chrome };
+        await chrome.tabs.setZoom(tabId, 1.25);
+      },
+      await chromeTabIdOf(alpha, alphaTab),
+    );
     const result = await call(
       alpha,
       `eval "() => devicePixelRatio"
@@ -363,9 +368,7 @@ get text #out`,
           );
         },
         await Promise.all(
-          [blankTab, popupTab, alphaTab].map((id) =>
-            chromeTabIdOf(alpha, id),
-          ),
+          [blankTab, popupTab, alphaTab].map((id) => chromeTabIdOf(alpha, id)),
         ),
       );
       expect(
@@ -442,10 +445,14 @@ get text #out`,
       await page.goto(fixtures.url("/ext-frame-sticky"));
       await page.locator("iframe").waitFor({ state: "attached" });
       const tabId = await toolTabIdOf(alpha, page.url());
-      const result = await call(alpha, `tab select ${tabId}\nget title`);
-      expect(!result.isError, result.text);
-      await call(alpha, `tab select ${alphaTab}`);
-      await page.close();
+      try {
+        const result = await call(alpha, `tab select ${tabId}\nget title`);
+        expect(!result.isError, result.text);
+      } finally {
+        // Back to the session's own tab whatever happened, so a failure here doesn't fail the sections after it
+        await call(alpha, `tab select ${alphaTab}`);
+        await page.close();
+      }
     },
   );
 
@@ -623,6 +630,24 @@ get text #out`,
     await Promise.resolve()
       .then(cleanup)
       .catch((error: unknown) => log("cleanup:", error));
+  }
+  // The daemons' logs go to the output, where a failed run's screenshots are
+  for (const dir of [home, path.join(tempRoot, "other-home")]) {
+    if (!existsSync(dir)) {
+      continue;
+    }
+    for (const file of readdirSync(dir)) {
+      if (file.endsWith(".log")) {
+        try {
+          copyFileSync(
+            path.join(dir, file),
+            path.join(outDir, `${path.basename(dir)}-${file}`),
+          );
+        } catch (error) {
+          log("cleanup:", error);
+        }
+      }
+    }
   }
   // The browser and daemon may still be writing their last files as they exit
   rmSync(tempRoot, {
@@ -886,9 +911,7 @@ async function tabCount() {
 /** The tool's ID for the tab at `url`, as `tab list` shows it. The daemon gives each browser's tabs IDs of its own, so they aren't Chrome's */
 async function toolTabIdOf(client: Client, url: string): Promise<number> {
   const list = await call(client, "tab list");
-  const line = list.text
-    .split("\n")
-    .find((each) => each.includes(` — ${url}`));
+  const line = list.text.split("\n").find((each) => each.includes(` — ${url}`));
   const id = Number(/^.\s*(\d+)\s/.exec(line ?? "")?.[1]);
   expect(id, `no tab for ${url} in:\n${list.text}`);
   return id;

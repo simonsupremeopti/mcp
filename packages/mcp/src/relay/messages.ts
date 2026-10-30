@@ -16,6 +16,10 @@ export function rejectedExtensionMessage(extensionId: string): string {
   return `The extension ${extensionId} tried to connect but isn't allowed. If it's a development build, add its ID to BROWSER_MCP_EXTENSION_IDS (comma-separated) in the AI app's MCP config for @browsermcp/mcp and restart the AI app or reconnect the MCP server`;
 }
 
+/** A tab whose debugger keeps detaching while Playwright opens it, e.g. another extension's frame that comes back when removed */
+export const TAB_DETACHED_MESSAGE =
+  "The debugger detached from the tab before it was ready. Another extension on the page may be putting its frame back. Try again, or use a tab without that extension's frame";
+
 export function noSuchBrowserMessage(browserId: string): string {
   return `There's no browser ${browserId} connected to Browser MCP. Run \`browser list\``;
 }

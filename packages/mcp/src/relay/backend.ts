@@ -464,7 +464,10 @@ export class RelayBackend implements BrowserBackend {
     if (this.slots.get(slot.id) !== slot) {
       throw new Error(ANOTHER_BROWSER_MESSAGE);
     }
-    return await slot.pageForTarget(targetInfo.targetId);
+    return await slot.pageForTarget(
+      targetInfo.targetId,
+      () => slot.bridge.targetId(tab) === targetInfo.targetId,
+    );
   }
 
   async cdpSession(tabId: number): Promise<CDPSession> {
